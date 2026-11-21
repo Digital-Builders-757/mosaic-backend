@@ -36,6 +36,43 @@ const { validateProductPublishState } = require('../lib/marketplace/listingPrice
 const { Decimal128 } = mongoose.Types;
 const s3Client = new S3Client(buildS3ClientConfig());
 
+// Replaced product media may only be deleted from storage when it is an object
+// this vendor uploaded via GET /api/product/upload-url (or variant-upload-url):
+// `https://<AWS_S3_BUCKET>.s3.<AWS_REGION>.amazonaws.com/products/<userId>/...`.
+// Anything else (another vendor's key, other prefixes, legacy Cloudinary or
+// foreign URLs) is left alone. The charset matches the MBH-055 media proxy key
+// rules; proxy URLs are mapped back to this canonical form before controllers.
+const PRODUCT_MEDIA_KEY_CHARSET = /^[A-Za-z0-9._\-/]+$/;
+
+const getOwnedProductMediaKey = (fileUrl, userId) => {
+  const bucket = process.env.AWS_S3_BUCKET;
+  if (typeof fileUrl !== 'string' || !bucket || !userId) return null;
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const objectBaseUrl = `https://${bucket}.s3.${region}.amazonaws.com/`;
+  if (!fileUrl.startsWith(objectBaseUrl)) return null;
+  const key = fileUrl.slice(objectBaseUrl.length);
+  if (!PRODUCT_MEDIA_KEY_CHARSET.test(key) || key.includes('amazonaws.com')) return null;
+  if (key.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')) return null;
+  return key.startsWith(`products/${userId}/`) ? key : null;
+};
+
+// Call only after the new URLs are saved. Skips URLs the vendor does not own
+// and URLs still referenced by any product or variant. Never throws.
+const deleteReplacedProductMedia = async (fileUrls, userId) => {
+  for (const fileUrl of new Set(fileUrls)) {
+    try {
+      if (!getOwnedProductMediaKey(fileUrl, String(userId))) continue;
+      const stillReferenced =
+        (await Product.exists({ $or: [{ coverImage: fileUrl }, { galleryImages: fileUrl }] })) ||
+        (await ProductVariant.exists({ images: fileUrl }));
+      if (stillReferenced) continue;
+      await deleteCloudinaryFile(fileUrl);
+    } catch (err) {
+      console.error('Skipped product media cleanup:', err.message);
+    }
+  }
+};
+
 const DEFAULT_PRODUCT_SHIPPING = { standard: 0, overnight: 0, local: 0 };
 const getGalleryImageLimit = (subscriptionPlan) =>
   subscriptionPlan?.limits?.galleryImageLimit ?? subscriptionPlan?.limits?.imageLimit ?? 0;
@@ -891,10 +928,65 @@ exports.updateProduct = async (req, res) => {
       });
     }
 
-    // Handle cover image change
-    if (coverImage && product.coverImage !== coverImage) {
-      await deleteCloudinaryFile(product.coverImage);
+    const nextPublished =
+      isPublished !== undefined ? isPublished : product.isPublished;
+
+    // Variants are only replaced when the request sends a `variants` array
+    // (the edit modal always does). Validate everything before any write.
+    const hasVariantPayload = Array.isArray(variants);
+    const normalizedVariants = [];
+    if (hasVariantPayload) {
+      for (const variant of variants) {
+        const normalizedVariant = normalizeVariantPayload(variant, { requirePrice: Boolean(!variant._id) });
+        if (!normalizedVariant.ok) {
+          return res.status(400).json({ error: normalizedVariant.error });
+        }
+        normalizedVariants.push(normalizedVariant);
+      }
     }
+
+    if (nextPublished) {
+      // Same check as after the writes below, run on the variants the request
+      // would leave behind, so a rejected publish deletes nothing.
+      const existingVariants = await ProductVariant.find({ productId });
+      let candidateVariants = existingVariants;
+      if (hasVariantPayload) {
+        candidateVariants = [];
+        variants.forEach((variant, index) => {
+          const normalizedVariant = normalizedVariants[index];
+          if (variant._id) {
+            const existingVariant = existingVariants.find((v) => String(v._id) === String(variant._id));
+            if (!existingVariant) return;
+            candidateVariants.push({
+              price: normalizedVariant.hasPrice ? normalizedVariant.price : existingVariant.price,
+              salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : existingVariant.salePrice,
+              isPublished: isPublished !== undefined ? isPublished : existingVariant.isPublished,
+            });
+          } else {
+            candidateVariants.push({
+              price: normalizedVariant.price,
+              salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : null,
+              isPublished: isPublished || false,
+            });
+          }
+        });
+      }
+      const publishPreCheck = validateProductPublishState({
+        product,
+        variants: candidateVariants,
+        isPublished: true,
+      });
+      if (!publishPreCheck.ok) {
+        return res.status(400).json({
+          error: publishPreCheck.message,
+          code: publishPreCheck.code,
+        });
+      }
+    }
+
+    // The old cover is removed from storage only after the product is saved.
+    const replacedCoverImage =
+      coverImage && product.coverImage !== coverImage ? product.coverImage : null;
 
     // -----------------------------
     // Update product fields
@@ -912,8 +1004,6 @@ exports.updateProduct = async (req, res) => {
     }
     product.metaFields = metaFields || product.metaFields;
     product.discount = discount || product.discount;
-    const nextPublished =
-      isPublished !== undefined ? isPublished : product.isPublished;
 
     await product.save();
 
@@ -922,7 +1012,7 @@ exports.updateProduct = async (req, res) => {
     // -----------------------------
     let savedVariants = [];
 
-    if (Array.isArray(variants) && variants.length > 0) {
+    if (hasVariantPayload && variants.length > 0) {
       // Get onboarding info once
       const onboarding = await VendorOnboardingStage1.findOne({ userId });
 
@@ -935,12 +1025,9 @@ exports.updateProduct = async (req, res) => {
         _id: { $nin: frontendVariantIds }
       });
 
-      for (const variant of variants) {
+      for (const [index, variant] of variants.entries()) {
         const attrMap = new Map(Object.entries(variant.attributes || {}));
-        const normalizedVariant = normalizeVariantPayload(variant, { requirePrice: Boolean(!variant._id) });
-        if (!normalizedVariant.ok) {
-          return res.status(400).json({ error: normalizedVariant.error });
-        }
+        const normalizedVariant = normalizedVariants[index];
 
         // UPDATE existing variant
         if (variant._id) {
@@ -1010,8 +1097,9 @@ exports.updateProduct = async (req, res) => {
           savedVariants.push(newVariant);
         }
       }
-    } else {
-      // If no variants sent, remove all variants
+    } else if (hasVariantPayload) {
+      // An explicit empty variants array removes all variants. A request
+      // without a variants array leaves the existing variants untouched.
       await ProductVariant.deleteMany({ productId });
     }
 
@@ -1054,6 +1142,10 @@ exports.updateProduct = async (req, res) => {
       product.price = null;
       product.maxPrice = null;
       await product.save();
+    }
+
+    if (replacedCoverImage) {
+      await deleteReplacedProductMedia([replacedCoverImage], userId);
     }
 
     return res.status(200).json({
@@ -1400,14 +1492,11 @@ exports.updateVariant = async (req, res) => {
       return res.status(400).json({ error: normalizedVariant.error });
     }
 
-    // Handle image cleanup if changed
-    if (images && images.length > 0) {
-      const oldImages = variant.images || [];
-      const imagesToDelete = oldImages.filter(img => !images.includes(img));
-      for (const oldImage of imagesToDelete) {
-        await deleteCloudinaryFile(oldImage);
-      }
-    }
+    // Replaced images are removed from storage only after the variant is saved.
+    const imagesToDelete =
+      images && images.length > 0
+        ? (variant.images || []).filter(img => !images.includes(img))
+        : [];
 
     // Update variant
     if (attributes) variant.attributes = new Map(Object.entries(attributes));
@@ -1452,6 +1541,7 @@ exports.updateVariant = async (req, res) => {
     if (isPublished !== undefined) variant.isPublished = isPublished;
 
     await variant.save();
+    await deleteReplacedProductMedia(imagesToDelete, req.user._id);
 
     // Auto-publish/unpublish product based on variants
     if (isPublished === true && !product.isPublished) {
