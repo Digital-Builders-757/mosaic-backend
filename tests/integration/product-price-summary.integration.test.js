@@ -140,6 +140,7 @@ test('PUT updateProduct invalid variant 400 is rejected before any write; produc
   // With #364's pre-write validation the invalid new variant is rejected
   // before A is saved or B is removed, so there is nothing to recompute.
   const res = await agent.put(`/api/product/${productId}`).send({
+    title: 'Renamed before rejection',
     variants: [
       { _id: a._id, attributes: { Size: 'A' }, price: 50 },
       { attributes: { Size: 'C' }, price: -1 },
@@ -147,6 +148,7 @@ test('PUT updateProduct invalid variant 400 is rejected before any write; produc
   });
   assert.equal(res.status, 400, JSON.stringify(res.body));
 
+  assert.equal((await Product.findById(productId)).title, 'Synthetic Price Summary Product');
   assert.equal((await ProductVariant.findById(a._id)).price.toString(), '20');
   assert.notEqual(await ProductVariant.findById(b._id), null);
   assert.equal(priceOf(await Product.findById(productId)), 10);
