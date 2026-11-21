@@ -40,8 +40,9 @@ const s3Client = new S3Client(buildS3ClientConfig());
 // this vendor uploaded via GET /api/product/upload-url (or variant-upload-url):
 // `https://<AWS_S3_BUCKET>.s3.<AWS_REGION>.amazonaws.com/products/<userId>/...`.
 // Anything else (another vendor's key, other prefixes, legacy Cloudinary or
-// foreign URLs) is left alone. The charset matches the MBH-055 media proxy key
-// rules; proxy URLs are mapped back to this canonical form before controllers.
+// foreign URLs) is left alone. The charset matches the key rules of the MBH-055
+// media proxy (backend #361, not part of this branch), which maps proxy URLs in
+// request bodies back to this canonical form before they reach controllers.
 const PRODUCT_MEDIA_KEY_CHARSET = /^[A-Za-z0-9._\-/]+$/;
 
 const getOwnedProductMediaKey = (fileUrl, userId) => {
@@ -936,7 +937,21 @@ exports.updateProduct = async (req, res) => {
     const hasVariantPayload = Array.isArray(variants);
     const normalizedVariants = [];
     if (hasVariantPayload) {
+      const seenVariantIds = new Set();
       for (const variant of variants) {
+        if (!variant || typeof variant !== 'object' || Array.isArray(variant)) {
+          return res.status(400).json({ code: 'PRODUCT_VALIDATION_FAILED', error: 'Each variant must be an object.' });
+        }
+        if (variant._id) {
+          if (!mongoose.Types.ObjectId.isValid(variant._id)) {
+            return res.status(400).json({ code: 'PRODUCT_VARIANT_INVALID', error: 'Invalid variant ID' });
+          }
+          const variantIdKey = String(variant._id);
+          if (seenVariantIds.has(variantIdKey)) {
+            return res.status(400).json({ code: 'PRODUCT_VARIANT_INVALID', error: 'Each variant can only appear once.' });
+          }
+          seenVariantIds.add(variantIdKey);
+        }
         const normalizedVariant = normalizeVariantPayload(variant, { requirePrice: Boolean(!variant._id) });
         if (!normalizedVariant.ok) {
           return res.status(400).json({ error: normalizedVariant.error });
@@ -961,6 +976,8 @@ exports.updateProduct = async (req, res) => {
               price: normalizedVariant.hasPrice ? normalizedVariant.price : existingVariant.price,
               salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : existingVariant.salePrice,
               isPublished: isPublished !== undefined ? isPublished : existingVariant.isPublished,
+              // The loop below keeps isDeleted as stored; the publish rule ignores deleted variants.
+              isDeleted: existingVariant.isDeleted,
             });
           } else {
             candidateVariants.push({
@@ -1494,7 +1511,7 @@ exports.updateVariant = async (req, res) => {
 
     // Replaced images are removed from storage only after the variant is saved.
     const imagesToDelete =
-      images && images.length > 0
+      Array.isArray(images) && images.length > 0
         ? (variant.images || []).filter(img => !images.includes(img))
         : [];
 

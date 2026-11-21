@@ -114,13 +114,25 @@ async function updateProduct(user, productId, body) {
   return res;
 }
 
+async function updateVariant(user, productId, variantId, body) {
+  const res = mockRes();
+  await controller.updateVariant({
+    params: { productId: String(productId), variantId: String(variantId) },
+    user: { _id: user._id },
+    body,
+  }, res);
+  return res;
+}
+
 // Records every S3 DeleteObject and the stored cover at the moment it is sent.
-function recordS3Deletes(t, productId) {
+function recordS3Deletes(t, productId, variantId) {
   const deletes = [];
   t.mock.method(S3Client.prototype, 'send', async (command) => {
     assert.ok(command instanceof DeleteObjectCommand, 'only deletes are expected');
-    const stored = productId ? await Product.findById(productId).lean() : null;
-    deletes.push({ key: command.input.Key, bucket: command.input.Bucket, storedCover: stored?.coverImage });
+    const entry = { key: command.input.Key, bucket: command.input.Bucket };
+    if (productId) entry.storedCover = (await Product.findById(productId).lean())?.coverImage;
+    if (variantId) entry.storedImages = (await ProductVariant.findById(variantId).lean())?.images;
+    deletes.push(entry);
     return {};
   });
   return deletes;
@@ -199,9 +211,10 @@ test('a failed save or rejected publish deletes nothing', async (t) => {
 
 test('a publish PUT without variants fails without deleting variants or price', async () => {
   const { user, business } = await seedVendor();
+  // Zero-price draft variants: the publish must be rejected by the price rule.
   const product = await createProduct(user, business, {
     coverImage: ownUrl(user, 'cover'),
-    variants: [variant('KEEP-1', 20, 'M'), variant('KEEP-2', 30, 'L')],
+    variants: [variant('KEEP-1', 0, 'M'), variant('KEEP-2', 0, 'L')],
   });
   const before = await Product.findById(product._id).lean();
 
@@ -266,4 +279,96 @@ test('draft PUT without variants keeps them; FE-shaped publish and empty array b
   const cleared = await updateProduct(user, product._id, { isPublished: false, variants: [] });
   assert.equal(cleared.statusCode, 200);
   assert.equal(await ProductVariant.countDocuments({ productId: product._id }), 0);
+});
+
+test('malformed variants payloads are rejected before any write', async (t) => {
+  const { user, business } = await seedVendor();
+  const product = await createProduct(user, business, {
+    coverImage: ownUrl(user, 'cover'),
+    variants: [variant('BAD-1', 20, 'M'), variant('BAD-2', 30, 'L')],
+  });
+  const [first] = await ProductVariant.find({ productId: product._id, sku: /BAD-1$/ });
+  const productSave = t.mock.method(Product.prototype, 'save');
+  const deleteMany = t.mock.method(ProductVariant, 'deleteMany');
+  const line = (extra = {}) => ({ _id: String(first._id), attributes: { Size: 'M' }, price: 20, stock: 2, ...extra });
+
+  for (const [variants, code] of [
+    [[line(), line()], 'PRODUCT_VARIANT_INVALID'], // duplicate _id
+    [[line({ _id: 'not-an-object-id' })], 'PRODUCT_VARIANT_INVALID'],
+    [[null], 'PRODUCT_VALIDATION_FAILED'],
+    [['variant'], 'PRODUCT_VALIDATION_FAILED'],
+    [[[line()]], 'PRODUCT_VALIDATION_FAILED'],
+  ]) {
+    for (const isPublished of [false, true]) {
+      const res = await updateProduct(user, product._id, { title: 'Changed', isPublished, variants });
+      assert.equal(res.statusCode, 400, JSON.stringify(variants));
+      assert.equal(res.body.code, code);
+      assert.equal(typeof res.body.error, 'string');
+    }
+  }
+  assert.equal(productSave.mock.callCount(), 0);
+  assert.equal(deleteMany.mock.callCount(), 0);
+  assert.equal(await ProductVariant.countDocuments({ productId: product._id }), 2);
+  assert.equal((await Product.findById(product._id)).title, 'Synthetic Product');
+});
+
+test('a soft-deleted variant _id does not count as live for publishing', async () => {
+  const { user, business } = await seedVendor();
+  const product = await createProduct(user, business, {
+    coverImage: ownUrl(user, 'cover'),
+    variants: [variant('SOFT-1', 20, 'M'), variant('SOFT-2', 30, 'L')],
+  });
+  const [deleted] = await ProductVariant.find({ productId: product._id, sku: /SOFT-1$/ });
+  await ProductVariant.updateOne({ _id: deleted._id }, { isDeleted: true });
+
+  // Only the soft-deleted variant is sent, which would drop the live one.
+  const res = await updateProduct(user, product._id, {
+    isPublished: true,
+    variants: [{ _id: String(deleted._id), attributes: { Size: 'M' }, price: 20, stock: 2 }],
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'LISTING_PRICE_REQUIRED');
+  assert.equal(await ProductVariant.countDocuments({ productId: product._id, isDeleted: { $ne: true } }), 1);
+  assert.equal((await Product.findById(product._id)).isPublished, false);
+});
+
+test('updateVariant deletes only the vendor own unreferenced replaced image, after the save', async (t) => {
+  const { user: other } = await seedVendor();
+  const { user, business } = await seedVendor();
+  const product = await createProduct(user, business, { coverImage: ownUrl(user, 'cover') });
+  const [stored] = await ProductVariant.find({ productId: product._id });
+  const otherVendorImage = `${S3_BASE}products/${other._id}/${product._id}/variants/1/other.webp`;
+  const onboardingImage = `${S3_BASE}vendor-onboarding/${user._id}/license.webp`;
+  const ownImage = `${S3_BASE}products/${user._id}/${product._id}/variants/1/own.webp`;
+  const newImage = `${S3_BASE}products/${user._id}/${product._id}/variants/1/new.webp`;
+  await ProductVariant.updateOne({ _id: stored._id }, { images: [otherVendorImage, onboardingImage, ownImage] });
+  const deletes = recordS3Deletes(t, null, stored._id);
+
+  const res = await updateVariant(user, product._id, stored._id, { images: [newImage] });
+
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.deepEqual(deletes, [{
+    key: `products/${user._id}/${product._id}/variants/1/own.webp`,
+    bucket: BUCKET,
+    storedImages: [newImage], // the variant was already saved when the delete ran
+  }]);
+});
+
+test('an updateVariant save failure deletes nothing', async (t) => {
+  const { user, business } = await seedVendor();
+  const product = await createProduct(user, business, { coverImage: ownUrl(user, 'cover') });
+  const [stored] = await ProductVariant.find({ productId: product._id });
+  const ownImage = `${S3_BASE}products/${user._id}/${product._id}/variants/1/own.webp`;
+  await ProductVariant.updateOne({ _id: stored._id }, { images: [ownImage] });
+  const deletes = recordS3Deletes(t);
+  t.mock.method(ProductVariant.prototype, 'save', async () => { throw new Error('synthetic save failure'); });
+
+  const res = await updateVariant(user, product._id, stored._id, {
+    images: [`${S3_BASE}products/${user._id}/${product._id}/variants/1/new.webp`],
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(deletes, []);
+  assert.deepEqual((await ProductVariant.findById(stored._id).lean()).images, [ownImage]);
 });
