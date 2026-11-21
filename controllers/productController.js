@@ -36,7 +36,9 @@ const { validateProductPublishState } = require('../lib/marketplace/listingPrice
 const {
   summarizeVariantPrices,
   recomputeProductPriceSummary,
+  recomputeProductPriceSummarySafe,
 } = require('../utils/productPriceSummary');
+const priceSummaryModels = { Product, ProductVariant };
 const { Decimal128 } = mongoose.Types;
 const s3Client = new S3Client(buildS3ClientConfig());
 
@@ -1128,6 +1130,8 @@ exports.updateProduct = async (req, res) => {
         isPublished: true,
       });
       if (!publishCheck.ok) {
+        // Variant deletes/saves above already persisted.
+        await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
         return res.status(400).json({
           error: publishCheck.message,
           code: publishCheck.code,
@@ -1434,7 +1438,7 @@ exports.addVariants = async (req, res) => {
     await Product.findByIdAndUpdate(productId, {
       $push: { variants: { $each: variantIds } },
     });
-    await recomputeProductPriceSummary(product._id);
+    await recomputeProductPriceSummary(product._id, priceSummaryModels);
 
     return res.status(201).json({
       message: 'Variants added successfully',
@@ -1541,7 +1545,7 @@ exports.updateVariant = async (req, res) => {
     if (isPublished !== undefined) variant.isPublished = isPublished;
 
     await variant.save();
-    await recomputeProductPriceSummary(product._id);
+    await recomputeProductPriceSummary(product._id, priceSummaryModels);
     await deleteReplacedProductMedia(imagesToDelete, req.user._id);
 
     // Auto-publish/unpublish product based on variants
@@ -1610,7 +1614,7 @@ exports.deleteVariant = async (req, res) => {
     // Soft delete
     variant.isDeleted = true;
     await variant.save();
-    await recomputeProductPriceSummary(product._id);
+    await recomputeProductPriceSummary(product._id, priceSummaryModels);
 
     // Remove from product's variants array (not a Product schema path, so
     // usually undefined; guard so the soft delete doesn't end in a 500)
