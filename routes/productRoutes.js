@@ -24,6 +24,9 @@ const {
   validateUpdateVariantInput  
 } = require('../validators/productValidators');
 
+const { validateVariantCreate, validateVariantUpdate } = require('../validators/variantValidators');
+const { rejectInvalidRequest } = require('../validators/requestValidation');
+
 const router = express.Router();
 
 // ============================================
@@ -163,7 +166,8 @@ router.post(
   '/add-variants/:productId',
   authenticate,
   isBusinessOwner,
-  // validateVariantInput,
+  validateVariantCreate,
+  rejectInvalidRequest,
   addVariants
 );
 
@@ -176,7 +180,8 @@ router.put(
   '/update-variant/:productId/:variantId',
   authenticate,
   isBusinessOwner,
-  // validateUpdateVariantInput,
+  validateVariantUpdate,
+  rejectInvalidRequest,
   updateVariant
 );
 
