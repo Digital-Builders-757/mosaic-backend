@@ -133,12 +133,12 @@ test('PUT updateProduct excludes soft-deleted variants from product.price', asyn
   assert.equal(Number(res.body.product.price.$numberDecimal), 25);
 });
 
-test('PUT updateProduct 400 after partial variant writes still refreshes product.price', async () => {
+test('PUT updateProduct invalid variant 400 is rejected before any write; product.price unchanged', async () => {
   const { agent, business } = await setupVendor();
   const { productId, a, b } = await createTwoVariantProduct(agent, business);
 
-  // Variant A is saved and B is removed (not in payload) before the invalid
-  // new variant triggers the in-loop 400.
+  // With #364's pre-write validation the invalid new variant is rejected
+  // before A is saved or B is removed, so there is nothing to recompute.
   const res = await agent.put(`/api/product/${productId}`).send({
     variants: [
       { _id: a._id, attributes: { Size: 'A' }, price: 50 },
@@ -147,7 +147,7 @@ test('PUT updateProduct 400 after partial variant writes still refreshes product
   });
   assert.equal(res.status, 400, JSON.stringify(res.body));
 
-  assert.equal((await ProductVariant.findById(a._id)).price.toString(), '50');
-  assert.equal(await ProductVariant.findById(b._id), null);
-  assert.equal(priceOf(await Product.findById(productId)), 50);
+  assert.equal((await ProductVariant.findById(a._id)).price.toString(), '20');
+  assert.notEqual(await ProductVariant.findById(b._id), null);
+  assert.equal(priceOf(await Product.findById(productId)), 10);
 });

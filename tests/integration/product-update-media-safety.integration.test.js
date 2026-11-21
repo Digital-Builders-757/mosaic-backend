@@ -372,3 +372,56 @@ test('an updateVariant save failure deletes nothing', async (t) => {
   assert.deepEqual(deletes, []);
   assert.deepEqual((await ProductVariant.findById(stored._id).lean()).images, [ownImage]);
 });
+
+// Combined #364 + #457 behavior on one product: the price summary uses the
+// listing policy's effective price (sale if > 0, else base if > 0, skipping
+// soft-deleted variants), so a $0 sale price never becomes the card price.
+test('combined: edit-modal publish with salePrice 0 prices from base, cover delete after save, no-variants publish keeps both', async (t) => {
+  const { user, business } = await seedVendor();
+  const oldCover = ownUrl(user, 'combined-old');
+  const newCover = ownUrl(user, 'combined-new');
+  const product = await createProduct(user, business, {
+    coverImage: oldCover,
+    variants: [variant('COMBO-1', 20, 'M'), variant('COMBO-2', 30, 'L')],
+  });
+  const deletes = recordS3Deletes(t, product._id);
+
+  // Edit modal payload: every variant with its _id and salePrice 0, publishing, new cover.
+  const stored = await ProductVariant.find({ productId: product._id }).lean();
+  const published = await updateProduct(user, product._id, {
+    title: 'Combined',
+    coverImage: newCover,
+    isPublished: true,
+    variants: stored.map((v) => ({
+      _id: String(v._id),
+      sku: v.sku,
+      attributes: v.attributes,
+      price: Number(v.price.toString()),
+      salePrice: 0,
+      stock: v.stock,
+    })),
+  });
+  assert.equal(published.statusCode, 200, JSON.stringify(published.body));
+  const afterPublish = await Product.findById(product._id).lean();
+  assert.equal(afterPublish.isPublished, true);
+  assert.equal(String(afterPublish.price), '20', 'salePrice 0 falls back to the $20 base price');
+  assert.deepEqual(deletes, [{
+    key: `products/${user._id}/covers/1700000000000-combined-old.webp`,
+    bucket: BUCKET,
+    storedCover: newCover, // deleted only after the new cover was saved
+  }]);
+
+  // Publish PUT without a variants array: variants and price are untouched.
+  deletes.length = 0;
+  const variantsBefore = await ProductVariant.find({ productId: product._id }).sort({ sku: 1 }).lean();
+  const again = await updateProduct(user, product._id, { title: 'Combined again', isPublished: true });
+  assert.equal(again.statusCode, 200, JSON.stringify(again.body));
+  const variantsAfter = await ProductVariant.find({ productId: product._id }).sort({ sku: 1 }).lean();
+  assert.deepEqual(
+    variantsAfter.map((v) => [String(v._id), String(v.price), String(v.salePrice), v.isDeleted === true]),
+    variantsBefore.map((v) => [String(v._id), String(v.price), String(v.salePrice), v.isDeleted === true]),
+  );
+  assert.equal(variantsAfter.length, 2);
+  assert.equal(String((await Product.findById(product._id)).price), '20');
+  assert.deepEqual(deletes, [], 'no cover change, no delete');
+});
