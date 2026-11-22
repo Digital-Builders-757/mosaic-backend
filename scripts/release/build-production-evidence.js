@@ -3,13 +3,24 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { selectProfile, REPOSITORY: CANONICAL_REPOSITORY } = require('./verify-focused-release-source');
 
 const FULL_SHA = /^[a-f0-9]{40}$/i;
-const FOCUSED_SOURCE_SHA = 'bcb9f101c58df6d7df994e94442970b91f36e74c';
-const FOCUSED_CHANGED_FILES = [
-  { status: 'M', file: 'controllers/bookingController.js' },
-  { status: 'A', file: 'tests/vendor/vendor-booking-type-filter.test.js' },
-];
+
+// The certificate must match the approved profile that the protected release
+// ref selects, using the same frozen allowlist as the source verifier.
+function focusedProfileFor(releaseRef) {
+  try {
+    const profile = selectProfile(releaseRef);
+    return {
+      name: profile.name,
+      sourceSha: profile.sourceSha,
+      changedFiles: profile.changedFiles.map(([status, file]) => ({ status, file })),
+    };
+  } catch {
+    return null;
+  }
+}
 
 function parseArgs(argv) {
   const values = {};
@@ -267,19 +278,23 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     || files.workflowResults?.releaseMode || 'unknown';
   const focusedBaseline = releaseMode === 'focused-baseline';
   const focusedSource = files.releaseIdentity?.focusedSource || null;
-  const focusedCertificate = files.releaseIdentity?.releaseSha === normalizedSha
+  const focusedProfile = focusedProfileFor(focusedSource?.releaseRef);
+  const focusedCertificate = focusedProfile
+    && files.releaseIdentity?.releaseSha === normalizedSha
     && files.sourceCertificate?.schemaVersion === 1
     && files.sourceCertificate?.mode === 'focused-baseline'
     && files.sourceCertificate?.status === 'passed'
-    && files.sourceCertificate?.repository === 'Techware-Hut/mosaic-backend'
+    && files.sourceCertificate?.repository === CANONICAL_REPOSITORY
     && files.sourceCertificate?.releaseSha === normalizedSha
     && files.sourceCertificate?.baselineSha === focusedSource?.baselineSha
     && files.sourceCertificate?.releaseRef === focusedSource?.releaseRef
     && files.sourceCertificate?.sourcePr === focusedSource?.sourcePr
     && files.sourceCertificate?.branchTipSha === normalizedSha
-    && files.sourceCertificate?.sourceSha === FOCUSED_SOURCE_SHA
+    && files.sourceCertificate?.sourceSha === focusedProfile.sourceSha
+    && (files.sourceCertificate?.profile === undefined
+      || files.sourceCertificate.profile === focusedProfile.name)
     && files.sourceCertificate?.productionAccepted === false
-    && JSON.stringify(files.sourceCertificate?.changedFiles) === JSON.stringify(FOCUSED_CHANGED_FILES)
+    && JSON.stringify(files.sourceCertificate?.changedFiles) === JSON.stringify(focusedProfile.changedFiles)
     ? files.sourceCertificate : null;
   const deployment = deriveDeploymentState(files.deployment, normalizedSha);
   const approvedTopologyPassed = exactReleaseEvidence(files.approvedTopology, normalizedSha);
@@ -308,7 +323,9 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     && files.checkoutSurface?.releaseMode === 'focused-baseline'
     && files.checkoutSurface?.baselineProvenance?.verified === true
     && files.checkoutSurface?.baselineProvenance?.targetSha === normalizedSha
-    && files.checkoutSurface?.baselineProvenance?.baselineSha === focusedSource?.baselineSha;
+    && files.checkoutSurface?.baselineProvenance?.baselineSha === focusedSource?.baselineSha
+    && files.checkoutSurface?.baselineProvenance?.releaseRef === focusedSource?.releaseRef
+    && files.checkoutSurface?.baselineProvenance?.profile === focusedProfile?.name;
   const focusedPublicProof = files.publicPreflight?.releaseMode === 'focused-baseline'
     && files.publicPreflight?.mode === 'preflight'
     && files.publicPreflight?.expectedSha === normalizedSha
@@ -371,7 +388,7 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
 
   return {
     schemaVersion: 2,
-    repository: process.env.GITHUB_REPOSITORY || 'Techware-Hut/mosaic-backend',
+    repository: process.env.GITHUB_REPOSITORY || CANONICAL_REPOSITORY,
     releaseMode,
     releaseSha: normalizedSha,
     focusedBaseline: focusedBaseline ? {

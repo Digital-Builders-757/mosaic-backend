@@ -259,11 +259,13 @@ jobs:
           RELEASE_SHA: ${{ needs.resolve-release.outputs.release_sha }}
           RELEASE_MODE: ${{ needs.resolve-release.outputs.release_mode }}
           BASELINE_SHA: ${{ needs.resolve-release.outputs.baseline_sha }}
+          RELEASE_REF: ${{ needs.resolve-release.outputs.release_ref }}
         run: |
           args=(--root release-target --release-mode "$RELEASE_MODE" \
             --output release-evidence/checkout-surface.json)
           if [ "$RELEASE_MODE" = "focused-baseline" ]; then
             args+=(--release-sha "$RELEASE_SHA" --baseline-sha "$BASELINE_SHA" \
+              --release-ref "$RELEASE_REF" \
               --baseline-repo release-control)
           fi
           node release-control/scripts/release/verify-checkout-surface-contract.js "${args[@]}"

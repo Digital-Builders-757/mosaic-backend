@@ -54,7 +54,7 @@ const {
 
 const shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
-const repository = 'Techware-Hut/mosaic-backend';
+const { CANONICAL_REPOSITORY: repository } = require('../../scripts/release/release-control-utils');
 
 const gateArnPrefix = 'arn:aws:elasticloadbalancing:us-east-1:123456789012:';
 const pinnedGateConfiguration = {
@@ -1026,7 +1026,10 @@ test('focused evidence keeps certification separate from deployment and rejects 
   });
   writeEvidenceFile(directory, 'checkout-surface.json', {
     status: 'passed', releaseMode: 'focused-baseline',
-    baselineProvenance: { verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA },
+    baselineProvenance: {
+      verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA,
+      releaseRef: 'refs/heads/release/focused/booking-filter', profile: 'dashboard-booking-filter',
+    },
   });
   writeEvidenceFile(directory, 'public-preflight.json', {
     mode: 'preflight', releaseMode: 'focused-baseline', expectedSha: shaA,
@@ -1049,6 +1052,28 @@ test('focused evidence keeps certification separate from deployment and rejects 
   assert.equal(evidence.deployment.attempted, false);
   assert.equal(evidence.focusedBaseline.externalGates.paymentLiability, 'not-proven');
   assert.equal(evidence.focusedBaseline.externalGates.protectedRefNoBypass, 'proven');
+
+  // Static route provenance must be bound to the same protected ref and profile.
+  const boundProvenance = {
+    verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA,
+    releaseRef: 'refs/heads/release/focused/booking-filter', profile: 'dashboard-booking-filter',
+  };
+  for (const mismatch of [
+    { releaseRef: 'refs/heads/release/focused/contact-recaptcha' },
+    { profile: 'contact-recaptcha' },
+    { releaseRef: undefined },
+  ]) {
+    writeEvidenceFile(directory, 'checkout-surface.json', {
+      status: 'passed', releaseMode: 'focused-baseline',
+      baselineProvenance: { ...boundProvenance, ...mismatch },
+    });
+    assert.equal(buildProductionEvidence({
+      directory, releaseSha: shaA, releaseMode: 'focused-baseline', jobStatus: 'success',
+    }).failingPhase, 'focused-static-checkout-artifact');
+  }
+  writeEvidenceFile(directory, 'checkout-surface.json', {
+    status: 'passed', releaseMode: 'focused-baseline', baselineProvenance: boundProvenance,
+  });
 
   writeEvidenceFile(directory, 'aws-approved-preflight.json', { status: 'passed', releaseSha: shaA });
   writeEvidenceFile(directory, 'gate-enabled.json', { status: 'passed', gateState: 'active' });
@@ -1099,6 +1124,54 @@ test('focused evidence keeps certification separate from deployment and rejects 
   assert.equal(evidence.failingPhase, 'exact-sha-ci');
   assert.equal(evidence.focusedBaseline.readOnlyPreflightPassed, false);
   assert.equal(evidence.tests.unit, 'failure');
+});
+
+test('focused evidence accepts a source certificate only for the profile its protected ref selects', (t) => {
+  const bookingCertificate = {
+    profile: 'dashboard-booking-filter',
+    sourceSha: 'bcb9f101c58df6d7df994e94442970b91f36e74c',
+    changedFiles: [
+      { status: 'M', file: 'controllers/bookingController.js' },
+      { status: 'A', file: 'tests/vendor/vendor-booking-type-filter.test.js' },
+    ],
+  };
+  const contactCertificate = {
+    profile: 'contact-recaptcha',
+    sourceSha: 'd7d0381e3af6091ec0b1f0fd22a43285da574a7e',
+    changedFiles: [
+      { status: 'M', file: 'controllers/contactInquiry.controller.js' },
+      { status: 'M', file: 'routes/contactInquiryRoutes.js' },
+      { status: 'A', file: 'tests/security/contact-inquiry-hardening.test.js' },
+      { status: 'A', file: 'utils/recaptcha.js' },
+    ],
+  };
+  const contactRef = 'refs/heads/release/focused/contact-recaptcha';
+  const bookingRef = 'refs/heads/release/focused/booking-filter';
+  const certified = (releaseRef, certificate) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mosaic-focused-profile-'));
+    t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+    const focusedSource = { baselineSha: FOCUSED_BASELINE_SHA, releaseRef, sourcePr: 369 };
+    writeEvidenceFile(directory, 'release-identity.json', {
+      mode: 'focused-baseline', releaseSha: shaA, focusedSource,
+    });
+    writeEvidenceFile(directory, 'source-certificate.json', {
+      schemaVersion: 1, mode: 'focused-baseline', status: 'passed', repository, releaseSha: shaA,
+      baselineSha: FOCUSED_BASELINE_SHA, releaseRef, sourcePr: 369, branchTipSha: shaA,
+      rulesetBypassActorsVisible: false, productionAccepted: false, ...certificate,
+    });
+    return buildProductionEvidence({
+      directory, releaseSha: shaA, releaseMode: 'focused-baseline', jobStatus: 'success',
+    }).focusedBaseline.externalGates.protectedRefNoBypass === 'proven';
+  };
+  assert.equal(certified(contactRef, contactCertificate), true);
+  assert.equal(certified(bookingRef, bookingCertificate), true);
+  assert.equal(certified(bookingRef, contactCertificate), false);
+  assert.equal(certified(contactRef, bookingCertificate), false);
+  assert.equal(certified(contactRef, { ...contactCertificate, profile: 'dashboard-booking-filter' }), false);
+  assert.equal(certified(contactRef, {
+    ...contactCertificate,
+    changedFiles: [...contactCertificate.changedFiles, { status: 'M', file: 'app.js' }],
+  }), false);
 });
 
 test('focused deploy validates approved baseline and protected ref before AWS access', () => {

@@ -7,6 +7,11 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const SHA_PATTERN = /^[a-f0-9]{40}$/;
+// The repository was transferred from Techware-Hut. GitHub redirects the old
+// name for API calls, but Actions (`github.repository`) and pull-request
+// payloads (`base.repo.full_name`) report only the current owner/name, so every
+// exact repository-identity gate compares against this one canonical value.
+const CANONICAL_REPOSITORY = 'Digital-Builders-757/mosaic-backend';
 const ARN_PATTERN = /^arn:aws(?:-[a-z]+)?:[a-z0-9-]+:[a-z0-9-]*:\d{12}:.+$/;
 
 function parseOptions(argv, { positionals = 0, booleans = [] } = {}) {
@@ -161,6 +166,7 @@ function nowIso(clock = () => new Date()) {
 
 module.exports = {
   ARN_PATTERN,
+  CANONICAL_REPOSITORY,
   SHA_PATTERN,
   assertArn,
   assertFullSha,

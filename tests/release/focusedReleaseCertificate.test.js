@@ -6,6 +6,8 @@ const {
   BASELINE_SHA,
   SOURCE_SHA,
   REPOSITORY,
+  FOCUSED_RELEASE_PROFILES,
+  selectProfile,
   parseArgs,
   verifyFocusedReleaseSource,
   verifyLocalProvenance,
@@ -93,36 +95,45 @@ function githubFixture(overrides = {}) {
   };
 }
 
-function gitFixture(overrides = {}) {
+const contactProfile = FOCUSED_RELEASE_PROFILES['contact-recaptcha'];
+const contactRef = 'refs/heads/release/focused/contact-recaptcha';
+const contactDiff = contactProfile.changedFiles.map(([status, file]) => `${status}\t${file}`).join('\n');
+
+function gitFixture(overrides = {}, {
+  sourceSha = SOURCE_SHA,
+  ref = releaseRef,
+  diff = exactDiff,
+  files = [['M', controllerPath], ['A', testPath]],
+} = {}) {
   const responses = new Map();
   const key = (args) => args.join('\0');
   const set = (args, output) => responses.set(key(args), output);
-  set(['fetch', '--no-tags', 'origin', BASELINE_SHA, SOURCE_SHA, releaseRef], '');
-  for (const sha of [BASELINE_SHA, SOURCE_SHA, releaseSha, candidateSha]) {
+  set(['fetch', '--no-tags', 'origin', BASELINE_SHA, sourceSha, ref], '');
+  for (const sha of [BASELINE_SHA, sourceSha, releaseSha, candidateSha]) {
     set(['rev-parse', '--verify', `${sha}^{commit}`], sha);
   }
   set(['rev-list', '--parents', '-n', '1', releaseSha], `${releaseSha} ${BASELINE_SHA} ${candidateSha}`);
   set(['rev-list', '--parents', '-n', '1', candidateSha], `${candidateSha} ${BASELINE_SHA}`);
-  set(['rev-list', '--parents', '-n', '1', SOURCE_SHA], `${SOURCE_SHA} ${sourceParentSha}`);
-  set(['log', '-1', '--format=%B', candidateSha], `Booking filter\n\n(cherry picked from commit ${SOURCE_SHA})`);
+  set(['rev-list', '--parents', '-n', '1', sourceSha], `${sourceSha} ${sourceParentSha}`);
+  set(['log', '-1', '--format=%B', candidateSha], `Booking filter\n\n(cherry picked from commit ${sourceSha})`);
   for (const [before, after] of [
     [BASELINE_SHA, candidateSha],
     [BASELINE_SHA, releaseSha],
-    [sourceParentSha, SOURCE_SHA],
+    [sourceParentSha, sourceSha],
   ]) {
-    set(['diff', '--no-ext-diff', '--no-renames', '--name-status', before, after], exactDiff);
+    set(['diff', '--no-ext-diff', '--no-renames', '--name-status', before, after], diff);
   }
   set(['diff', '--check', BASELINE_SHA, releaseSha], '');
   set(['rev-parse', `${candidateSha}^{tree}`], treeSha);
   set(['rev-parse', `${releaseSha}^{tree}`], treeSha);
-  for (const sha of [SOURCE_SHA, candidateSha, releaseSha]) {
-    set(['ls-tree', sha, '--', controllerPath], `100644 blob ${'1'.repeat(40)}\t${controllerPath}`);
-    set(['ls-tree', sha, '--', testPath], `100644 blob ${'2'.repeat(40)}\t${testPath}`);
-  }
-  for (const sha of [sourceParentSha, BASELINE_SHA]) {
-    set(['ls-tree', sha, '--', controllerPath], `100644 blob ${'3'.repeat(40)}\t${controllerPath}`);
-    set(['ls-tree', sha, '--', testPath], '');
-  }
+  files.forEach(([status, file], index) => {
+    for (const sha of [sourceSha, candidateSha, releaseSha]) {
+      set(['ls-tree', sha, '--', file], `100644 blob ${String(index + 1).repeat(40)}\t${file}`);
+    }
+    for (const sha of [sourceParentSha, BASELINE_SHA]) {
+      set(['ls-tree', sha, '--', file], status === 'A' ? '' : `100644 blob ${'a'.repeat(39)}${index}\t${file}`);
+    }
+  });
   for (const [command, value] of Object.entries(overrides)) responses.set(command, value);
   const calls = [];
   return {
@@ -168,6 +179,31 @@ test('CLI accepts only the exact approved baseline, protected ref, and complete 
   ]), /approved production SHA/);
   await assert.rejects(verify({ releaseRef: 'refs/heads/release/focused/Nested/branch' }), /releaseRef/);
   await assert.rejects(verify({ repository: 'attacker/mosaic-backend' }), /canonical/);
+  // The transferred-away owner is no longer canonical; GitHub Actions and PR
+  // payloads report only the current owner, so the old name is rejected.
+  await assert.rejects(verify({ repository: 'Techware-Hut/mosaic-backend' }), /canonical/);
+});
+
+test('repository identity gates use the single canonical transferred repository name', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { CANONICAL_REPOSITORY } = require('../../scripts/release/release-control-utils');
+  assert.equal(CANONICAL_REPOSITORY, 'Digital-Builders-757/mosaic-backend');
+  assert.equal(REPOSITORY, CANONICAL_REPOSITORY);
+  const root = path.resolve(__dirname, '../..');
+  const enforce = fs.readFileSync(path.join(root, '.github/workflows/enforce-staging-to-main.yml'), 'utf8');
+  assert.match(enforce, new RegExp(`const approvedRepository = '${CANONICAL_REPOSITORY}';`));
+  const gating = [
+    '.github/workflows/enforce-staging-to-main.yml',
+    '.github/workflows/deploy-eb-production.yml',
+    'scripts/release/build-production-evidence.js',
+    'scripts/release/verify-focused-release-source.js',
+    'scripts/release/verify-main-release-source.js',
+    'scripts/release/verify-checkout-surface-contract.js',
+  ];
+  for (const file of gating) {
+    assert.doesNotMatch(fs.readFileSync(path.join(root, file), 'utf8'), /Techware-Hut/i, file);
+  }
 });
 
 test('certificate binds protected branch, merged PR, current review, exact Git graph and source blobs', async () => {
@@ -295,4 +331,151 @@ test('local provenance rejects an extra path, wrong parent, altered blob, or mis
     const altered = gitFixture({ [fixture.key(command)]: output });
     assert.throws(() => verifyLocalProvenance({ ...base, runGit: altered.run }), expected);
   }
+});
+
+function contactGitFixture(overrides = {}) {
+  return gitFixture(overrides, {
+    sourceSha: contactProfile.sourceSha,
+    ref: contactRef,
+    diff: contactDiff,
+    files: contactProfile.changedFiles,
+  });
+}
+
+test('profile allowlist is frozen and selected only by the protected release ref', () => {
+  assert(Object.isFrozen(FOCUSED_RELEASE_PROFILES));
+  assert.deepEqual(Object.keys(FOCUSED_RELEASE_PROFILES).sort(), ['contact-recaptcha', 'dashboard-booking-filter']);
+  for (const profile of Object.values(FOCUSED_RELEASE_PROFILES)) {
+    assert(Object.isFrozen(profile));
+    assert(Object.isFrozen(profile.changedFiles));
+    assert(profile.changedFiles.every((entry) => Object.isFrozen(entry)));
+  }
+  assert.equal(FOCUSED_RELEASE_PROFILES['dashboard-booking-filter'].sourceSha, SOURCE_SHA);
+  assert.equal(contactProfile.sourceSha, 'd7d0381e3af6091ec0b1f0fd22a43285da574a7e');
+  assert.equal(contactProfile.releaseRef, contactRef);
+  assert.equal(selectProfile(contactRef).name, 'contact-recaptcha');
+  for (const ref of [releaseRef, 'refs/heads/release/focused/dashboard-booking-filter',
+    'refs/heads/release/focused/contact-recaptcha-2']) {
+    assert.equal(selectProfile(ref).name, 'dashboard-booking-filter');
+  }
+  assert.throws(() => selectProfile(contactRef, 'unknown-profile'), /Unknown focused release profile/);
+  assert.throws(() => selectProfile(contactRef, '__proto__'), /Unknown focused release profile/);
+  assert.throws(() => selectProfile(contactRef, 'dashboard-booking-filter'), /does not match the protected release ref/);
+  assert.throws(() => selectProfile(releaseRef, 'contact-recaptcha'), /does not match the protected release ref/);
+  for (const ref of ['refs/heads/release/focused/Contact-Recaptcha', 'refs/heads/release/contact-recaptcha',
+    'refs/heads/release/focused/contact/recaptcha', undefined]) {
+    assert.throws(() => selectProfile(ref), /releaseRef/);
+  }
+});
+
+test('booking profile still certifies its fixture and keeps its exact two-file set', async () => {
+  const provenance = verifyLocalProvenance({
+    releaseSha, baselineSha: BASELINE_SHA, releaseRef, candidateSha, runGit: gitFixture().run,
+  });
+  assert.equal(provenance.profile, 'dashboard-booking-filter');
+  assert.equal(provenance.sourceSha, SOURCE_SHA);
+  assert.deepEqual(provenance.changedFiles, [
+    { status: 'M', file: controllerPath },
+    { status: 'A', file: testPath },
+  ]);
+  const result = await verify({ profile: 'dashboard-booking-filter' });
+  assert.equal(result.profile, 'dashboard-booking-filter');
+  await assert.rejects(verify({ profile: 'contact-recaptcha' }), /does not match the protected release ref/);
+});
+
+test('contact-recaptcha profile certifies exactly its four approved files on its own ref', async () => {
+  const contactBranch = contactRef.slice('refs/heads/'.length);
+  const github = githubFixture({
+    [`/repos/${REPOSITORY}/git/ref/heads/${contactBranch}`]: {
+      ref: contactRef,
+      object: { type: 'commit', sha: releaseSha },
+    },
+    [`/repos/${REPOSITORY}/pulls/456`]: pullRequest({
+      base: { ref: contactBranch, repo: { full_name: REPOSITORY } },
+    }),
+  });
+  const git = contactGitFixture();
+  const result = await verify({ github, git, releaseRef: contactRef });
+  assert.equal(result.status, 'passed');
+  assert.equal(result.profile, 'contact-recaptcha');
+  assert.equal(result.sourceSha, contactProfile.sourceSha);
+  assert.equal(result.releaseRef, contactRef);
+  assert.equal(result.changedFiles.map(({ status, file }) => `${status}\t${file}`).join('\n'), contactDiff);
+  assert.deepEqual(Object.keys(result.fileBlobs).sort(), contactProfile.changedFiles.map(([, file]) => file).sort());
+  assert(git.calls.some((args) => args[0] === 'fetch' && args.includes(contactProfile.sourceSha)
+    && args.includes(contactRef) && !args.includes(SOURCE_SHA)));
+  await assert.rejects(verify({ github, git: contactGitFixture(), releaseRef: contactRef, profile: 'nope' }),
+    /Unknown focused release profile/);
+});
+
+test('contact and booking profiles reject each other\'s file sets and source commits', () => {
+  const contactBase = { releaseSha, baselineSha: BASELINE_SHA, releaseRef: contactRef, candidateSha };
+  const bookingBase = { releaseSha, baselineSha: BASELINE_SHA, releaseRef, candidateSha };
+  // The contact ref with the booking two-file set fails closed.
+  const bookingFilesOnContact = gitFixture({}, { sourceSha: contactProfile.sourceSha, ref: contactRef });
+  assert.throws(() => verifyLocalProvenance({ ...contactBase, runGit: bookingFilesOnContact.run }),
+    /exactly the approved contact inquiry reCAPTCHA/);
+  // The contact ref never fetches or accepts the booking source commit.
+  assert.throws(() => verifyLocalProvenance({ ...contactBase, runGit: gitFixture().run }), /Unexpected git command fetch/);
+  // A booking (non-contact) focused ref with the contact four-file set fails closed.
+  const contactFilesOnBooking = gitFixture({}, { diff: contactDiff, files: contactProfile.changedFiles });
+  assert.throws(() => verifyLocalProvenance({ ...bookingBase, runGit: contactFilesOnBooking.run }),
+    /exactly the approved booking controller and test changes/);
+  assert.throws(() => verifyLocalProvenance({ ...bookingBase, runGit: contactGitFixture().run }),
+    /Unexpected git command fetch/);
+});
+
+test('contact profile rejects an extra or missing file, a wrong trailer, extra parent, or altered blobs', () => {
+  const base = { releaseSha, baselineSha: BASELINE_SHA, releaseRef: contactRef, candidateSha };
+  const [, controller] = contactProfile.changedFiles[0];
+  const cases = [
+    [
+      ['diff', '--no-ext-diff', '--no-renames', '--name-status', BASELINE_SHA, releaseSha],
+      `${contactDiff}\nM\tapp.js`,
+      /exactly the approved contact inquiry reCAPTCHA/,
+    ],
+    [
+      ['diff', '--no-ext-diff', '--no-renames', '--name-status', BASELINE_SHA, candidateSha],
+      contactDiff.split('\n').slice(0, 3).join('\n'),
+      /exactly the approved contact inquiry reCAPTCHA/,
+    ],
+    [
+      ['diff', '--no-ext-diff', '--no-renames', '--name-status', sourceParentSha, contactProfile.sourceSha],
+      `${contactDiff}\nM\troutes/index.js`,
+      /exactly the approved contact inquiry reCAPTCHA/,
+    ],
+    [
+      ['log', '-1', '--format=%B', candidateSha],
+      `Contact reCAPTCHA\n\n(cherry picked from commit ${SOURCE_SHA})`,
+      /cherry-pick provenance/,
+    ],
+    [
+      ['log', '-1', '--format=%B', candidateSha],
+      `Contact reCAPTCHA\n\n(cherry picked from commit ${'9'.repeat(40)})`,
+      /cherry-pick provenance/,
+    ],
+    [
+      ['ls-tree', releaseSha, '--', controller],
+      `100644 blob ${'9'.repeat(40)}\t${controller}`,
+      /blob or mode differs/,
+    ],
+    [
+      ['ls-tree', BASELINE_SHA, '--', controller],
+      `100644 blob ${'8'.repeat(40)}\t${controller}`,
+      /differs from the approved source parent/,
+    ],
+    [
+      ['rev-list', '--parents', '-n', '1', candidateSha],
+      `${candidateSha} ${BASELINE_SHA} ${sourceParentSha}`,
+      /one commit directly on the production baseline/,
+    ],
+  ];
+  for (const [command, output, expected] of cases) {
+    const fixture = contactGitFixture();
+    const altered = contactGitFixture({ [fixture.key(command)]: output });
+    assert.throws(() => verifyLocalProvenance({ ...base, runGit: altered.run }), expected);
+  }
+  assert.throws(() => verifyLocalProvenance({
+    ...base, baselineSha: 'a'.repeat(40), runGit: contactGitFixture().run,
+  }), /approved production SHA/);
 });

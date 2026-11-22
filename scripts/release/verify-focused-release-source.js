@@ -5,16 +5,63 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { githubRequestFactory } = require('./verify-main-release-source');
+const { CANONICAL_REPOSITORY } = require('./release-control-utils');
 
-const REPOSITORY = 'Techware-Hut/mosaic-backend';
+const REPOSITORY = CANONICAL_REPOSITORY;
 const BASELINE_SHA = '9bc75c257a9f483a287f122dbd38514b7a4b55d4';
-const SOURCE_SHA = 'bcb9f101c58df6d7df994e94442970b91f36e74c';
 const FULL_SHA = /^[a-f0-9]{40}$/;
 const FOCUSED_REF = /^refs\/heads\/release\/focused\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const CHANGED_FILES = Object.freeze([
-  ['M', 'controllers/bookingController.js'],
-  ['A', 'tests/vendor/vendor-booking-type-filter.test.js'],
-]);
+const FOCUSED_REF_PREFIX = 'refs/heads/release/focused/';
+
+function freezeProfile(profile) {
+  return Object.freeze({
+    ...profile,
+    changedFiles: Object.freeze(profile.changedFiles.map((entry) => Object.freeze([...entry]))),
+  });
+}
+
+// Frozen allowlist of independently approved focused corrections. Each profile
+// pins one exact source commit and its exact name-status file set. Every other
+// focused-release check (baseline pin, two-parent merge, single cherry-pick,
+// blob equality, ruleset, independent approval) applies unchanged to all
+// profiles. New profiles require a reviewed change to this trusted main file.
+//
+// Selection is derived from the protected release ref, never from PR content:
+// a profile with a pinned releaseRef is selected only by exactly that ref, and
+// that ref can select nothing else. The original booking correction predates
+// profiles and keeps its legacy behavior as the default for every other
+// well-formed release/focused/* ref.
+const DEFAULT_PROFILE_NAME = 'dashboard-booking-filter';
+const FOCUSED_RELEASE_PROFILES = Object.freeze({
+  'dashboard-booking-filter': freezeProfile({
+    name: 'dashboard-booking-filter',
+    sourceSha: 'bcb9f101c58df6d7df994e94442970b91f36e74c',
+    releaseRef: null,
+    sourceLabel: 'booking',
+    changeLabel: 'booking controller and test changes',
+    changedFiles: [
+      ['M', 'controllers/bookingController.js'],
+      ['A', 'tests/vendor/vendor-booking-type-filter.test.js'],
+    ],
+  }),
+  'contact-recaptcha': freezeProfile({
+    name: 'contact-recaptcha',
+    sourceSha: 'd7d0381e3af6091ec0b1f0fd22a43285da574a7e',
+    releaseRef: `${FOCUSED_REF_PREFIX}contact-recaptcha`,
+    sourceLabel: 'contact-recaptcha',
+    changeLabel: 'contact inquiry reCAPTCHA controller, route, utility, and test changes',
+    changedFiles: [
+      ['M', 'controllers/contactInquiry.controller.js'],
+      ['M', 'routes/contactInquiryRoutes.js'],
+      ['A', 'tests/security/contact-inquiry-hardening.test.js'],
+      ['A', 'utils/recaptcha.js'],
+    ],
+  }),
+});
+const DEFAULT_PROFILE = FOCUSED_RELEASE_PROFILES[DEFAULT_PROFILE_NAME];
+// Backward-compatible exports for the original booking correction.
+const SOURCE_SHA = DEFAULT_PROFILE.sourceSha;
+const CHANGED_FILES = DEFAULT_PROFILE.changedFiles;
 
 function requireSha(value, label) {
   if (!FULL_SHA.test(value || '')) throw new Error(`${label} must be a lowercase full SHA`);
@@ -26,6 +73,22 @@ function requireRef(value) {
     throw new Error('releaseRef must be a single lowercase, hyphenated refs/heads/release/focused/* branch');
   }
   return value;
+}
+
+function selectProfile(releaseRef, requestedProfile) {
+  requireRef(releaseRef);
+  const pinned = Object.values(FOCUSED_RELEASE_PROFILES).filter((profile) => profile.releaseRef === releaseRef);
+  if (pinned.length > 1) throw new Error('Focused release ref maps to more than one approved profile');
+  const selected = pinned[0] || DEFAULT_PROFILE;
+  if (requestedProfile !== undefined) {
+    if (typeof requestedProfile !== 'string' || !Object.hasOwn(FOCUSED_RELEASE_PROFILES, requestedProfile)) {
+      throw new Error('Unknown focused release profile');
+    }
+    if (requestedProfile !== selected.name) {
+      throw new Error('Requested focused release profile does not match the protected release ref');
+    }
+  }
+  return selected;
 }
 
 function requirePrNumber(value) {
@@ -70,13 +133,13 @@ function parseParents(value, expectedSha, label) {
   return shas.slice(1);
 }
 
-function parseDiff(value, label) {
+function parseDiff(value, label, profile = DEFAULT_PROFILE) {
   const entries = value ? value.trim().split(/\r?\n/).map((line) => line.split('\t')) : [];
   if (entries.some((entry) => entry.length !== 2)) throw new Error(`${label} name-status diff was malformed`);
   const actual = entries.map(([status, file]) => `${status}\t${file}`).sort();
-  const expected = CHANGED_FILES.map(([status, file]) => `${status}\t${file}`).sort();
+  const expected = profile.changedFiles.map(([status, file]) => `${status}\t${file}`).sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`${label} must contain exactly the approved booking controller and test changes`);
+    throw new Error(`${label} must contain exactly the approved ${profile.changeLabel}`);
   }
 }
 
@@ -88,15 +151,20 @@ function gitTreeEntry(runGit, sha, file) {
   return { mode: match[1], blobSha: match[2] };
 }
 
-function verifyLocalProvenance({ releaseSha, baselineSha, releaseRef, candidateSha, runGit = gitRunner }) {
+function verifyLocalProvenance({
+  releaseSha, baselineSha, releaseRef, candidateSha, profile: requestedProfile, runGit = gitRunner,
+}) {
   requireSha(releaseSha, 'releaseSha');
   requireSha(baselineSha, 'baselineSha');
   requireSha(candidateSha, 'candidateSha');
   requireRef(releaseRef);
   if (baselineSha !== BASELINE_SHA) throw new Error('Focused baseline differs from the approved production SHA');
+  const profile = selectProfile(releaseRef, requestedProfile);
+  const sourceSha = profile.sourceSha;
+  const changedFiles = profile.changedFiles;
   // Fetch the protected remote ref, not code or an artifact supplied by the PR.
-  runGit(['fetch', '--no-tags', 'origin', baselineSha, SOURCE_SHA, releaseRef]);
-  for (const sha of [baselineSha, SOURCE_SHA, releaseSha, candidateSha]) {
+  runGit(['fetch', '--no-tags', 'origin', baselineSha, sourceSha, releaseRef]);
+  for (const sha of [baselineSha, sourceSha, releaseSha, candidateSha]) {
     if (runGit(['rev-parse', '--verify', `${sha}^{commit}`]) !== sha) {
       throw new Error(`Git did not resolve exact commit ${sha}`);
     }
@@ -110,16 +178,16 @@ function verifyLocalProvenance({ releaseSha, baselineSha, releaseRef, candidateS
   if (candidateParents.length !== 1 || candidateParents[0] !== baselineSha) {
     throw new Error('Reviewed candidate must be one commit directly on the production baseline');
   }
-  const sourceParents = parseParents(runGit(['rev-list', '--parents', '-n', '1', SOURCE_SHA]), SOURCE_SHA, 'Approved source');
-  if (sourceParents.length !== 1) throw new Error('Approved booking source must have one parent');
+  const sourceParents = parseParents(runGit(['rev-list', '--parents', '-n', '1', sourceSha]), sourceSha, 'Approved source');
+  if (sourceParents.length !== 1) throw new Error(`Approved ${profile.sourceLabel} source must have one parent`);
 
   const cherryPickMessage = runGit(['log', '-1', '--format=%B', candidateSha]);
-  if (!new RegExp(`^\\(cherry picked from commit ${SOURCE_SHA}\\)$`, 'm').test(cherryPickMessage)) {
+  if (!new RegExp(`^\\(cherry picked from commit ${sourceSha}\\)$`, 'm').test(cherryPickMessage)) {
     throw new Error('Reviewed candidate lacks the exact approved cherry-pick provenance trailer');
   }
-  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', baselineSha, candidateSha]), 'Candidate');
-  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', baselineSha, releaseSha]), 'Release');
-  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', sourceParents[0], SOURCE_SHA]), 'Approved source');
+  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', baselineSha, candidateSha]), 'Candidate', profile);
+  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', baselineSha, releaseSha]), 'Release', profile);
+  parseDiff(runGit(['diff', '--no-ext-diff', '--no-renames', '--name-status', sourceParents[0], sourceSha]), 'Approved source', profile);
   runGit(['diff', '--check', baselineSha, releaseSha]);
 
   const candidateTree = runGit(['rev-parse', `${candidateSha}^{tree}`]);
@@ -128,8 +196,8 @@ function verifyLocalProvenance({ releaseSha, baselineSha, releaseRef, candidateS
     throw new Error('Merge tree differs from the reviewed one-commit cherry-pick tree');
   }
   const fileBlobs = {};
-  for (const [, file] of CHANGED_FILES) {
-    const source = gitTreeEntry(runGit, SOURCE_SHA, file);
+  for (const [, file] of changedFiles) {
+    const source = gitTreeEntry(runGit, sourceSha, file);
     const candidate = gitTreeEntry(runGit, candidateSha, file);
     const release = gitTreeEntry(runGit, releaseSha, file);
     if (!source || !candidate || !release
@@ -146,11 +214,12 @@ function verifyLocalProvenance({ releaseSha, baselineSha, releaseRef, candidateS
   }
 
   return {
+    profile: profile.name,
     releaseTree,
     candidateSha,
-    sourceSha: SOURCE_SHA,
+    sourceSha,
     sourceParentSha: sourceParents[0],
-    changedFiles: CHANGED_FILES.map(([status, file]) => ({ status, file })),
+    changedFiles: changedFiles.map(([status, file]) => ({ status, file })),
     fileBlobs,
   };
 }
@@ -247,14 +316,16 @@ async function verifyFocusedReleaseSource({
   baselineSha,
   releaseRef,
   prNumber,
+  profile: requestedProfile,
   githubRequest,
   runGit = gitRunner,
 }) {
-  if (repository !== REPOSITORY) throw new Error('Focused release repository must be canonical Techware-Hut/mosaic-backend');
+  if (repository !== REPOSITORY) throw new Error(`Focused release repository must be canonical ${REPOSITORY}`);
   requireSha(releaseSha, 'releaseSha');
   requireSha(baselineSha, 'baselineSha');
   if (baselineSha !== BASELINE_SHA) throw new Error('Focused baseline differs from the approved production SHA');
   requireRef(releaseRef);
+  const profile = selectProfile(releaseRef, requestedProfile);
   requirePrNumber(prNumber);
   if (typeof githubRequest !== 'function') throw new Error('githubRequest is required');
 
@@ -276,7 +347,9 @@ async function verifyFocusedReleaseSource({
   }
   const reviews = await getAllReviews(githubRequest, repository, prNumber);
   const approval = validateApproval(reviews, pullRequest, candidateSha);
-  const provenance = verifyLocalProvenance({ releaseSha, baselineSha, releaseRef, candidateSha, runGit });
+  const provenance = verifyLocalProvenance({
+    releaseSha, baselineSha, releaseRef, candidateSha, profile: profile.name, runGit,
+  });
   const finalRef = await githubRequest(`/repos/${repository}/git/ref/heads/${releaseBranch}`);
   if (finalRef?.ref !== releaseRef || finalRef?.object?.type !== 'commit'
     || finalRef.object.sha !== releaseSha) {
@@ -292,7 +365,8 @@ async function verifyFocusedReleaseSource({
     baselineSha,
     releaseRef,
     releaseTree: provenance.releaseTree,
-    sourceSha: SOURCE_SHA,
+    profile: profile.name,
+    sourceSha: profile.sourceSha,
     sourceParentSha: provenance.sourceParentSha,
     candidateSha,
     sourcePr: prNumber,
@@ -339,6 +413,8 @@ module.exports = {
   SOURCE_SHA,
   REPOSITORY,
   CHANGED_FILES,
+  FOCUSED_RELEASE_PROFILES,
+  selectProfile,
   parseArgs,
   parseDiff,
   validateApproval,

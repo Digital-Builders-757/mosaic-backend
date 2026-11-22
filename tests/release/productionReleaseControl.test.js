@@ -44,9 +44,14 @@ const {
 } = require('../../scripts/release/query-active-reservations');
 const {
   APPROVED_BASELINE_SHA,
+  BASELINE_OBJECTS,
+  PINNED_ROUTE_FILES,
   analyzeCheckoutSurface,
+  focusedRouteExemptions,
+  main: checkoutSurfaceMain,
   verifyFocusedBaselineProvenance,
 } = require('../../scripts/release/verify-checkout-surface-contract');
+const { FOCUSED_RELEASE_PROFILES } = require('../../scripts/release/verify-focused-release-source');
 const {
   hasCanonicalPostRoute,
   hasLegacyPostRoute,
@@ -419,33 +424,214 @@ test('focused-baseline source gate requires both approved routes and exact basel
   assert.equal(analyzeCheckoutSurface(inputs).nextAction.includes('retired'), false);
 });
 
-test('focused-baseline provenance compares exact target route tree and legacy controller Git objects', () => {
+function focusedProvenanceFixture() {
   const releaseSha = 'a'.repeat(40);
   const objectIds = new Map([
     ['HEAD^{commit}', releaseSha],
     [`${APPROVED_BASELINE_SHA}^{commit}`, APPROVED_BASELINE_SHA],
   ]);
-  for (const name of ['app.js', 'routes', 'controllers/paymentController.js']) {
+  for (const name of ['app.js', 'controllers/paymentController.js']) {
     objectIds.set(`HEAD:${name}`, 'b'.repeat(40));
     objectIds.set(`${APPROVED_BASELINE_SHA}:${name}`, 'b'.repeat(40));
   }
-  const fakeGit = (_binary, args) => `${objectIds.get(args.at(-1)) || ''}\n`;
-  const options = {
-    root: 'target',
-    baselineRepo: 'controller',
-    releaseSha,
-    baselineSha: APPROVED_BASELINE_SHA,
-    git: fakeGit,
+  const baselineRoutes = new Map([
+    'routes/admin/adminOrderRoutes.js',
+    'routes/authRoutes.js',
+    'routes/bookingRoutes.js',
+    'routes/contactInquiryRoutes.js',
+    'routes/orderRoutes.js',
+    'routes/paymentRoutes.js',
+    'routes/stripeRoutes.js',
+    'routes/subscriptionRoutes.js',
+    'routes/webhookRoutes.js',
+  ].map((file, index) => [file, { mode: '100644', type: 'blob', id: String(index + 1).repeat(40) }]));
+  const trees = {
+    HEAD: new Map([...baselineRoutes].map(([file, entry]) => [file, { ...entry }])),
+    [APPROVED_BASELINE_SHA]: baselineRoutes,
   };
+  const calls = [];
+  const fakeGit = (_binary, args) => {
+    calls.push(args);
+    if (args[2] === 'ls-tree') {
+      assert.deepEqual(args.slice(3, 6), ['-r', '-z', '--full-tree']);
+      assert.deepEqual(args.slice(-2), ['--', 'routes']);
+      const tree = trees[args[6]];
+      if (!tree) throw new Error('unknown revision');
+      return [...tree].map(([file, entry]) => `${entry.mode} ${entry.type} ${entry.id}\t${file}\0`).join('');
+    }
+    const objectId = objectIds.get(args.at(-1));
+    if (!objectId) throw new Error('unknown object');
+    return `${objectId}\n`;
+  };
+  return {
+    releaseSha,
+    objectIds,
+    targetRoutes: trees.HEAD,
+    calls,
+    options: {
+      root: 'target',
+      baselineRepo: 'controller',
+      releaseSha,
+      releaseRef: 'refs/heads/release/focused/contact-recaptcha',
+      baselineSha: APPROVED_BASELINE_SHA,
+      git: fakeGit,
+    },
+  };
+}
+
+test('focused-baseline provenance pins app, legacy controller, and every route file Git object', () => {
+  const { releaseSha, objectIds, targetRoutes, options } = focusedProvenanceFixture();
   const result = verifyFocusedBaselineProvenance(options);
   assert.equal(result.verified, true);
-  assert.deepEqual(result.comparedObjects, ['app.js', 'routes', 'controllers/paymentController.js']);
+  assert.equal(result.targetSha, releaseSha);
+  assert.equal(result.releaseRef, 'refs/heads/release/focused/contact-recaptcha');
+  assert.equal(result.profile, 'contact-recaptcha');
+  assert.deepEqual(result.comparedObjects, ['app.js', 'controllers/paymentController.js']);
+  assert.deepEqual(BASELINE_OBJECTS, ['app.js', 'controllers/paymentController.js']);
+  assert.equal(result.routeTree.fileCount, 9);
+  assert.equal(result.routeTree.unchangedFiles.length, 9);
+  assert.deepEqual(result.routeTree.profileModifiedFiles, []);
   assert.throws(() => verifyFocusedBaselineProvenance({ ...options, baselineSha: 'c'.repeat(40) }), /approved production SHA/);
   assert.throws(() => verifyFocusedBaselineProvenance({ ...options, releaseSha: 'c'.repeat(40) }), /HEAD differs/);
-  objectIds.set('HEAD:routes', 'c'.repeat(40));
-  assert.throws(() => verifyFocusedBaselineProvenance(options), /changes approved payment route provenance: routes/);
-  objectIds.delete('HEAD:routes');
+  for (const releaseRef of [undefined, '', 'refs/heads/main', 'refs/heads/release/focused/Contact']) {
+    assert.throws(() => verifyFocusedBaselineProvenance({ ...options, releaseRef }), /releaseRef must be/);
+  }
+
+  objectIds.set('HEAD:app.js', 'c'.repeat(40));
+  assert.throws(() => verifyFocusedBaselineProvenance(options), /changes approved payment route provenance: app\.js/);
+  objectIds.set('HEAD:app.js', 'b'.repeat(40));
+  objectIds.set('HEAD:controllers/paymentController.js', 'c'.repeat(40));
+  assert.throws(() => verifyFocusedBaselineProvenance(options),
+    /changes approved payment route provenance: controllers\/paymentController\.js/);
+  objectIds.delete('HEAD:controllers/paymentController.js');
   assert.throws(() => verifyFocusedBaselineProvenance(options), /Git provenance is unavailable/);
+  objectIds.set('HEAD:controllers/paymentController.js', 'b'.repeat(40));
+
+  targetRoutes.clear();
+  assert.throws(() => verifyFocusedBaselineProvenance(options), /Git provenance is unavailable/);
+});
+
+test('focused contact profile may change only its listed route file', () => {
+  const { targetRoutes, options } = focusedProvenanceFixture();
+  targetRoutes.get('routes/contactInquiryRoutes.js').id = 'f'.repeat(40);
+  const result = verifyFocusedBaselineProvenance(options);
+  assert.equal(result.verified, true);
+  assert.deepEqual(result.routeTree.profileModifiedFiles, ['routes/contactInquiryRoutes.js']);
+  assert.equal(result.routeTree.unchangedFiles.includes('routes/contactInquiryRoutes.js'), false);
+  assert.equal(result.routeTree.unchangedFiles.length, 8);
+
+  // A listed modification must stay a regular blob with the same mode.
+  targetRoutes.get('routes/contactInquiryRoutes.js').mode = '100755';
+  assert.throws(() => verifyFocusedBaselineProvenance(options), /outside the approved profile: routes\/contactInquiryRoutes\.js/);
+  targetRoutes.get('routes/contactInquiryRoutes.js').mode = '120000';
+  assert.throws(() => verifyFocusedBaselineProvenance(options), /outside the approved profile: routes\/contactInquiryRoutes\.js/);
+  targetRoutes.get('routes/contactInquiryRoutes.js').mode = '100644';
+
+  // The booking profile (selected by every other focused ref) lists no route file.
+  assert.throws(() => verifyFocusedBaselineProvenance({
+    ...options, releaseRef: 'refs/heads/release/focused/booking-filter',
+  }), /outside the approved profile: routes\/contactInquiryRoutes\.js/);
+});
+
+test('focused profiles can never change payment-sensitive or unlisted route files', () => {
+  const sensitive = [
+    'routes/paymentRoutes.js',
+    'routes/orderRoutes.js',
+    'routes/admin/adminOrderRoutes.js',
+    'routes/stripeRoutes.js',
+    'routes/subscriptionRoutes.js',
+    'routes/webhookRoutes.js',
+  ];
+  for (const file of sensitive) {
+    for (const releaseRef of [
+      'refs/heads/release/focused/contact-recaptcha',
+      'refs/heads/release/focused/booking-filter',
+    ]) {
+      const { targetRoutes, options } = focusedProvenanceFixture();
+      targetRoutes.get(file).id = 'f'.repeat(40);
+      assert.throws(() => verifyFocusedBaselineProvenance({ ...options, releaseRef }),
+        new RegExp(`changes approved payment route provenance: ${file.replace(/[./]/g, '\\$&')}`));
+    }
+  }
+  // Mode-only change of a pinned route is still a provenance change.
+  {
+    const { targetRoutes, options } = focusedProvenanceFixture();
+    targetRoutes.get('routes/paymentRoutes.js').mode = '100755';
+    assert.throws(() => verifyFocusedBaselineProvenance(options), /payment route provenance: routes\/paymentRoutes\.js/);
+  }
+  // A modified route file the selected profile does not list.
+  {
+    const { targetRoutes, options } = focusedProvenanceFixture();
+    targetRoutes.get('routes/authRoutes.js').id = 'f'.repeat(40);
+    assert.throws(() => verifyFocusedBaselineProvenance(options), /outside the approved profile: routes\/authRoutes\.js/);
+  }
+  // Added or removed route files, including nested and payment-sensitive ones.
+  for (const added of ['routes/newRoutes.js', 'routes/admin/extra.js', 'routes/checkoutRoutes.js']) {
+    const { targetRoutes, options } = focusedProvenanceFixture();
+    targetRoutes.set(added, { mode: '100644', type: 'blob', id: 'f'.repeat(40) });
+    assert.throws(() => verifyFocusedBaselineProvenance(options), new RegExp(`adds route file: ${added.replace(/[./]/g, '\\$&')}`));
+  }
+  for (const removed of ['routes/contactInquiryRoutes.js', 'routes/paymentRoutes.js', 'routes/authRoutes.js']) {
+    const { targetRoutes, options } = focusedProvenanceFixture();
+    targetRoutes.delete(removed);
+    assert.throws(() => verifyFocusedBaselineProvenance(options), new RegExp(`removes route file: ${removed.replace(/[./]/g, '\\$&')}`));
+  }
+});
+
+test('focused profile route allowlist rejects payment-sensitive, added, or deleted route entries', () => {
+  const profile = (changedFiles) => ({ name: 'hypothetical', changedFiles });
+  assert.deepEqual([...focusedRouteExemptions(FOCUSED_RELEASE_PROFILES['contact-recaptcha'])],
+    ['routes/contactInquiryRoutes.js']);
+  assert.deepEqual([...focusedRouteExemptions(FOCUSED_RELEASE_PROFILES['dashboard-booking-filter'])], []);
+  for (const approved of Object.values(FOCUSED_RELEASE_PROFILES)) {
+    assert.doesNotThrow(() => focusedRouteExemptions(approved));
+  }
+  for (const file of [
+    ...PINNED_ROUTE_FILES,
+    'routes/PaymentRoutes.js',
+    'routes/admin/adminOrderRoutes.js',
+    'routes/stripe.routes.js',
+    'routes/webhookRoutes.js',
+    'routes/subscriptionPlanRoutes.js',
+    'routes/billing/index.js',
+    'routes/invoiceRoutes.js',
+    'routes/CHECKOUT.js',
+  ]) {
+    assert.throws(() => focusedRouteExemptions(profile([['M', file]])), /may not change payment-sensitive route/);
+  }
+  assert.throws(() => focusedRouteExemptions(profile([['A', 'routes/newRoutes.js']])), /only modify existing route files/);
+  assert.throws(() => focusedRouteExemptions(profile([['D', 'routes/authRoutes.js']])), /only modify existing route files/);
+  assert.deepEqual([...focusedRouteExemptions(profile([
+    ['M', 'controllers/paymentController.js'],
+    ['M', 'app.js'],
+    ['M', 'routes/authRoutes.js'],
+  ]))], ['routes/authRoutes.js']);
+});
+
+test('checkout surface CLI requires the protected focused ref and passes it to provenance', () => {
+  const runtimeRouteSources = ["app.use('/api/orders', orderRoutes);"];
+  const base = [
+    '--output', 'unused.json', '--release-mode', 'focused-baseline',
+    '--release-sha', 'a'.repeat(40), '--baseline-sha', APPROVED_BASELINE_SHA,
+  ];
+  assert.throws(() => checkoutSurfaceMain(base, {
+    root: 'target', runtimeRouteSources, paymentRoutesSource: '', orderRoutesSource: ' ',
+    git: () => { throw new Error('git must not run without a release ref'); },
+  }), /--release-ref/);
+  const { options } = focusedProvenanceFixture();
+  let written;
+  assert.throws(() => checkoutSurfaceMain([...base, '--release-ref', options.releaseRef], {
+    root: 'target',
+    runtimeRouteSources,
+    paymentRoutesSource: '',
+    orderRoutesSource: ' ',
+    git: options.git,
+    writeJson: (_file, value) => { written = value; },
+  }), /approved dual-route baseline/);
+  assert.equal(written.baselineProvenance.verified, true);
+  assert.equal(written.baselineProvenance.releaseRef, options.releaseRef);
+  assert.equal(written.baselineProvenance.profile, 'contact-recaptcha');
+  assert.match(workflow, /RELEASE_REF: \$\{\{ needs\.resolve-release\.outputs\.release_ref \}\}[\s\S]*--release-ref "\$RELEASE_REF"[\s\S]*--baseline-repo release-control/);
 });
 
 test('focused-baseline target route proof requires both actual mounted POST routes', async () => {
