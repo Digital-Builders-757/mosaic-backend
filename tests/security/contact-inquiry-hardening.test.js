@@ -268,3 +268,47 @@ test('unset verification warns only once', async () => {
   assert.equal(calls,2);assert.equal(warnings.length,1);
  } finally {console.warn=old;}
 });
+
+// ---------- Contact Us recipient (CONTACT_INBOX_EMAIL) ----------
+
+async function sendWithEnv(envPatch) {
+  const saved = {};
+  for (const k of ['CONTACT_INBOX_EMAIL', 'ADMIN_EMAIL']) { saved[k] = process.env[k]; delete process.env[k]; }
+  Object.assign(process.env, envPatch);
+  try {
+    const { controller, sent } = loadController();
+    const out = res();
+    await controller.createContactInquiry({ body: { firstName: 'QA', subject: 'synthetic' } }, out);
+    assert.equal(out.statusCode, 201);
+    assert.equal(sent.length, 1);
+    return sent[0].to;
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
+
+test('Contact Us mail goes to CONTACT_INBOX_EMAIL when set, never ADMIN_EMAIL', async () => {
+  const to = await sendWithEnv({ CONTACT_INBOX_EMAIL: ' inbox@example.com ', ADMIN_EMAIL: 'admin@example.com' });
+  assert.equal(to, 'inbox@example.com');
+});
+
+test('Contact Us mail falls back to ADMIN_EMAIL when CONTACT_INBOX_EMAIL is unset or blank', async () => {
+  assert.equal(await sendWithEnv({ ADMIN_EMAIL: 'admin@example.com' }), 'admin@example.com');
+  assert.equal(await sendWithEnv({ CONTACT_INBOX_EMAIL: '   ', ADMIN_EMAIL: 'admin@example.com' }), 'admin@example.com');
+});
+
+test('CONTACT_INBOX_EMAIL is read only by the Contact Us controller', () => {
+  const fs = require('node:fs');
+  const root = path.resolve(__dirname, '../..');
+  const hits = [];
+  for (const dir of ['controllers', 'routes', 'utils', 'middlewares', 'services']) {
+    const abs = path.join(root, dir);
+    if (!fs.existsSync(abs)) continue;
+    for (const f of fs.readdirSync(abs, { recursive: true })) {
+      if (!String(f).endsWith('.js')) continue;
+      const src = fs.readFileSync(path.join(abs, String(f)), 'utf8');
+      if (/contactInbox|CONTACT_INBOX_EMAIL/.test(src)) hits.push(`${dir}/${String(f).split(path.sep).join('/')}`);
+    }
+  }
+  assert.deepEqual(hits.sort(), ['controllers/contactInquiry.controller.js', 'utils/contactInbox.js', 'utils/isolationSelfCheck.js']);
+});

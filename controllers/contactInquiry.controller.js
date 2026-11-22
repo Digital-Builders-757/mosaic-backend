@@ -4,6 +4,7 @@ const {
   createMosaicTransport,
   formatMosaicFromHeader,
 } = require('../utils/smtpTransport');
+const { getContactInboxEmail } = require('../utils/contactInbox');
 
 const transporter = createMosaicTransport(nodemailer);
 
@@ -38,7 +39,7 @@ exports.createContactInquiry = async (req, res) => {
     try {
       const mailOptions = {
         from: formatMosaicFromHeader(),
-        to: process.env.ADMIN_EMAIL,
+        to: getContactInboxEmail(),
         subject: toHeaderText(`New Contact Inquiry: ${subject}`),
         html: `
           <h2>New Contact Inquiry</h2>

@@ -8,7 +8,8 @@
 const { isRecaptchaEnforced, getAllowedHostnames } = require('./recaptcha');
 const { isStagingEnv } = require('./frontendUrl');
 const { getReleaseEnvironment } = require('./releaseIdentity');
-const { getMailAllowlist, getSmsAllowlist } = require('./recipientAllowlist');
+const { getMailAllowlist, getSmsAllowlist, isMailAddressAllowed } = require('./recipientAllowlist');
+const { getContactInboxEmail, isContactInboxExplicit } = require('./contactInbox');
 
 const WEBHOOK_SECRET_ENVS = Object.freeze({
   order: 'STRIPE_ORDER_WEBHOOK_SECRET',
@@ -97,6 +98,13 @@ function getIsolationSelfCheck(options = {}) {
     contactVerification: isRecaptchaEnforced(env) ? 'enforced' : 'not_configured',
     allowedHostnameCount: getAllowedHostnames(env).length,
     adminEmailExplicit: isSet(env, 'ADMIN_EMAIL'),
+    // Booleans only: whether Contact Us has its own inbox, and whether its
+    // effective recipient passes the staging mail allowlist (always false
+    // when the allowlist is not active).
+    contactInbox: {
+      explicit: isContactInboxExplicit(env),
+      allowlisted: mailAllowlist.active && isMailAddressAllowed(getContactInboxEmail(env), mailAllowlist),
+    },
   };
 }
 

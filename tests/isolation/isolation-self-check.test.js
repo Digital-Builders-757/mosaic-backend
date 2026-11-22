@@ -45,7 +45,7 @@ test('getIsolationSelfCheck returns the documented shape with booleans/enums onl
   });
 
   assert.deepEqual(Object.keys(check).sort(), [
-    'adminEmailExplicit', 'allowedHostnameCount', 'contactVerification', 'database', 'environment', 'jobs', 'mail', 'sms', 'stagingMarker', 'storage', 'stripe',
+    'adminEmailExplicit', 'allowedHostnameCount', 'contactInbox', 'contactVerification', 'database', 'environment', 'jobs', 'mail', 'sms', 'stagingMarker', 'storage', 'stripe',
   ]);
   assert.equal(check.stagingMarker, true);
   assert.equal(typeof check.environment, 'string');
@@ -176,4 +176,16 @@ test('contact verification reports configuration without secrets', () => {
     assert.equal(JSON.stringify(check).includes('synthetic-secret'), false);
     assert.equal(isLikelySafePublicReleasePayload(check), true);
   }
+});
+
+test('contactInbox reports booleans only and checks the effective recipient against the allowlist', () => {
+  const run = (overrides) => getIsolationSelfCheck({ env: stagingEnv(overrides), connection: { name: 'mosaic_staging' }, getJobs: () => ({}) }).contactInbox;
+  // Falls back to ADMIN_EMAIL (admin@example.com), which is not allowlisted.
+  assert.deepEqual(run({}), { explicit: false, allowlisted: false });
+  assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'qa@example.com' }), { explicit: true, allowlisted: true });
+  assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'info@example.net' }), { explicit: true, allowlisted: false });
+  // Not hosted staging: allowlist inactive, so never reported as allowlisted.
+  const prod = getIsolationSelfCheck({ env: { CONTACT_INBOX_EMAIL: 'qa@example.com' }, connection: null, getJobs: () => ({}) }).contactInbox;
+  assert.deepEqual(prod, { explicit: true, allowlisted: false });
+  assert.doesNotMatch(JSON.stringify(run({ CONTACT_INBOX_EMAIL: 'qa@example.com' })), /@/);
 });
