@@ -93,11 +93,12 @@ const sentryHttpCapture = require('./middlewares/sentryHttpCapture');
 const requestIdMiddleware = require('./middlewares/requestId');
 const { isSentryEnabled } = require('./instrument');
 const { getAllowedOrigins, isAllowedCredentialOrigin } = require('./utils/corsOrigins');
+const { resolveTrustProxyHops } = require('./utils/trustProxy');
 
 const app = express();
 
 const allowedOrigins = getAllowedOrigins();
-app.set('trust proxy', 1);
+app.set('trust proxy', resolveTrustProxyHops(process.env.TRUST_PROXY_HOPS));
 app.use(requestIdMiddleware);
 app.use(sentryHttpCapture);
 app.use(cors({
