@@ -11,11 +11,21 @@ const {
   sanitizeMessage,
   writeJson,
 } = require('./release-control-utils');
+const { selectProfile } = require('./verify-focused-release-source');
 
 const LEGACY_PATH = '/create-payment-intent';
 const LEGACY_MOUNT = '/api/payments';
 const APPROVED_BASELINE_SHA = '9bc75c257a9f483a287f122dbd38514b7a4b55d4';
-const BASELINE_OBJECTS = Object.freeze(['app.js', 'routes', 'controllers/paymentController.js']);
+// Exact Git objects that every focused release must leave byte-identical to the
+// approved production baseline, regardless of the selected focused profile.
+const BASELINE_OBJECTS = Object.freeze(['app.js', 'controllers/paymentController.js']);
+// The route tree is compared per file (recursively). Every route file must equal
+// the baseline (same path, mode, type, and blob; none added or removed) except a
+// file the selected frozen focused profile lists as modified ('M'). Payment-
+// sensitive route files can never be exempted, even if a profile lists them.
+const BASELINE_ROUTE_TREE = 'routes';
+const PINNED_ROUTE_FILES = Object.freeze(['routes/paymentRoutes.js', 'routes/orderRoutes.js']);
+const PAYMENT_SENSITIVE_ROUTE = /payment|order|checkout|stripe|webhook|subscription|billing|invoice/i;
 const NON_RUNTIME_DIRECTORIES = new Set([
   '.git',
   '.github',
@@ -237,13 +247,45 @@ function analyzeCheckoutSurface({ appSource, paymentRoutesSource, orderRoutesSou
   };
 }
 
-function verifyFocusedBaselineProvenance({ root, baselineRepo, releaseSha, baselineSha = APPROVED_BASELINE_SHA, git = execFileSync }) {
+function isPinnedRouteFile(file) {
+  return PINNED_ROUTE_FILES.includes(file) || PAYMENT_SENSITIVE_ROUTE.test(file);
+}
+
+// Route files the selected focused profile may modify. Fails closed when the
+// profile would add, delete, or modify a payment-sensitive route file.
+function focusedRouteExemptions(profile) {
+  const exemptions = new Set();
+  for (const [status, file] of profile.changedFiles) {
+    if (!file.startsWith(`${BASELINE_ROUTE_TREE}/`)) continue;
+    if (isPinnedRouteFile(file)) {
+      throw new Error(`Focused profile may not change payment-sensitive route: ${file}`);
+    }
+    if (status !== 'M') {
+      throw new Error(`Focused profile may only modify existing route files: ${file}`);
+    }
+    exemptions.add(file);
+  }
+  return exemptions;
+}
+
+function verifyFocusedBaselineProvenance({
+  root,
+  baselineRepo,
+  releaseSha,
+  releaseRef,
+  baselineSha = APPROVED_BASELINE_SHA,
+  git = execFileSync,
+}) {
   if (baselineSha !== APPROVED_BASELINE_SHA) {
     throw new Error('Focused release baseline must be the approved production SHA');
   }
   if (!/^[a-f0-9]{40}$/.test(String(releaseSha || ''))) {
     throw new Error('Focused release requires an exact release SHA');
   }
+  // The protected release ref selects the frozen profile exactly as the source
+  // verifier does; a missing or malformed ref fails closed here.
+  const profile = selectProfile(releaseRef);
+  const routeExemptions = focusedRouteExemptions(profile);
   const readObject = (repository, revision) => {
     try {
       const objectId = String(git('git', ['-C', repository, 'rev-parse', '--verify', revision], {
@@ -255,6 +297,27 @@ function verifyFocusedBaselineProvenance({ root, baselineRepo, releaseSha, basel
     } catch (_error) {
       throw new Error('Focused baseline Git provenance is unavailable');
     }
+  };
+  const readRouteTree = (repository, revision) => {
+    let output;
+    try {
+      output = String(git('git', [
+        '-C', repository, 'ls-tree', '-r', '-z', '--full-tree', revision, '--', BASELINE_ROUTE_TREE,
+      ], { encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024 }));
+    } catch (_error) {
+      throw new Error('Focused baseline Git provenance is unavailable');
+    }
+    const entries = new Map();
+    for (const record of output.split('\0')) {
+      if (record === '' || record === '\n') continue;
+      const match = record.match(/^([0-7]{6}) (blob|commit|tree) ([a-f0-9]{40})\t(.+)$/);
+      if (!match || !match[4].startsWith(`${BASELINE_ROUTE_TREE}/`) || entries.has(match[4])) {
+        throw new Error('Focused baseline route tree listing was malformed');
+      }
+      entries.set(match[4], { mode: match[1], type: match[2], objectId: match[3] });
+    }
+    if (entries.size === 0) throw new Error('Focused baseline Git provenance is unavailable');
+    return entries;
   };
   const targetSha = readObject(root, 'HEAD^{commit}');
   if (targetSha !== releaseSha) {
@@ -272,7 +335,48 @@ function verifyFocusedBaselineProvenance({ root, baselineRepo, releaseSha, basel
     }
     comparedObjects.push(sourcePath);
   }
-  return { verified: true, baselineSha, targetSha, comparedObjects };
+
+  const targetRoutes = readRouteTree(root, 'HEAD');
+  const baselineRoutes = readRouteTree(baselineRepo, baselineSha);
+  for (const file of PINNED_ROUTE_FILES) {
+    if (!baselineRoutes.has(file)) throw new Error(`Approved baseline lacks pinned route: ${file}`);
+  }
+  const unchangedRouteFiles = [];
+  const profileModifiedRouteFiles = [];
+  for (const file of [...new Set([...baselineRoutes.keys(), ...targetRoutes.keys()])].sort()) {
+    const baseline = baselineRoutes.get(file);
+    const target = targetRoutes.get(file);
+    if (!baseline || !target) {
+      throw new Error(`Focused target ${baseline ? 'removes' : 'adds'} route file: ${file}`);
+    }
+    if (baseline.mode === target.mode && baseline.type === target.type
+      && baseline.objectId === target.objectId) {
+      unchangedRouteFiles.push(file);
+      continue;
+    }
+    if (isPinnedRouteFile(file)) {
+      throw new Error(`Focused target changes approved payment route provenance: ${file}`);
+    }
+    if (!routeExemptions.has(file) || baseline.type !== 'blob' || target.type !== 'blob'
+      || baseline.mode !== target.mode) {
+      throw new Error(`Focused target changes a route file outside the approved profile: ${file}`);
+    }
+    profileModifiedRouteFiles.push(file);
+  }
+  return {
+    verified: true,
+    baselineSha,
+    targetSha,
+    releaseRef,
+    profile: profile.name,
+    comparedObjects,
+    routeTree: {
+      path: BASELINE_ROUTE_TREE,
+      fileCount: baselineRoutes.size,
+      unchangedFiles: unchangedRouteFiles,
+      profileModifiedFiles: profileModifiedRouteFiles,
+    },
+  };
 }
 
 function collectRuntimeRouteSources(root, dependencies = {}) {
@@ -321,6 +425,7 @@ function main(argv = process.argv.slice(2), dependencies = {}) {
       root,
       baselineRepo: path.resolve(options['--baseline-repo'] || path.resolve(__dirname, '../..')),
       releaseSha: requireOption(options, '--release-sha').toLowerCase(),
+      releaseRef: requireOption(options, '--release-ref'),
       baselineSha: requireOption(options, '--baseline-sha').toLowerCase(),
       git: dependencies.git || execFileSync,
     }))
@@ -356,6 +461,10 @@ if (require.main === module) {
 module.exports = {
   APPROVED_BASELINE_SHA,
   BASELINE_OBJECTS,
+  BASELINE_ROUTE_TREE,
+  PAYMENT_SENSITIVE_ROUTE,
+  PINNED_ROUTE_FILES,
+  focusedRouteExemptions,
   analyzeCheckoutSurface,
   collectRuntimeRouteSources,
   dynamicExpressPostRegistrations,

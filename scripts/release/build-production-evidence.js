@@ -3,7 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { selectProfile } = require('./verify-focused-release-source');
+const { selectProfile, REPOSITORY: CANONICAL_REPOSITORY } = require('./verify-focused-release-source');
 
 const FULL_SHA = /^[a-f0-9]{40}$/i;
 
@@ -284,7 +284,7 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     && files.sourceCertificate?.schemaVersion === 1
     && files.sourceCertificate?.mode === 'focused-baseline'
     && files.sourceCertificate?.status === 'passed'
-    && files.sourceCertificate?.repository === 'Techware-Hut/mosaic-backend'
+    && files.sourceCertificate?.repository === CANONICAL_REPOSITORY
     && files.sourceCertificate?.releaseSha === normalizedSha
     && files.sourceCertificate?.baselineSha === focusedSource?.baselineSha
     && files.sourceCertificate?.releaseRef === focusedSource?.releaseRef
@@ -323,7 +323,9 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     && files.checkoutSurface?.releaseMode === 'focused-baseline'
     && files.checkoutSurface?.baselineProvenance?.verified === true
     && files.checkoutSurface?.baselineProvenance?.targetSha === normalizedSha
-    && files.checkoutSurface?.baselineProvenance?.baselineSha === focusedSource?.baselineSha;
+    && files.checkoutSurface?.baselineProvenance?.baselineSha === focusedSource?.baselineSha
+    && files.checkoutSurface?.baselineProvenance?.releaseRef === focusedSource?.releaseRef
+    && files.checkoutSurface?.baselineProvenance?.profile === focusedProfile?.name;
   const focusedPublicProof = files.publicPreflight?.releaseMode === 'focused-baseline'
     && files.publicPreflight?.mode === 'preflight'
     && files.publicPreflight?.expectedSha === normalizedSha
@@ -386,7 +388,7 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
 
   return {
     schemaVersion: 2,
-    repository: process.env.GITHUB_REPOSITORY || 'Techware-Hut/mosaic-backend',
+    repository: process.env.GITHUB_REPOSITORY || CANONICAL_REPOSITORY,
     releaseMode,
     releaseSha: normalizedSha,
     focusedBaseline: focusedBaseline ? {

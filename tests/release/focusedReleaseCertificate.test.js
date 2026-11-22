@@ -179,6 +179,31 @@ test('CLI accepts only the exact approved baseline, protected ref, and complete 
   ]), /approved production SHA/);
   await assert.rejects(verify({ releaseRef: 'refs/heads/release/focused/Nested/branch' }), /releaseRef/);
   await assert.rejects(verify({ repository: 'attacker/mosaic-backend' }), /canonical/);
+  // The transferred-away owner is no longer canonical; GitHub Actions and PR
+  // payloads report only the current owner, so the old name is rejected.
+  await assert.rejects(verify({ repository: 'Techware-Hut/mosaic-backend' }), /canonical/);
+});
+
+test('repository identity gates use the single canonical transferred repository name', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { CANONICAL_REPOSITORY } = require('../../scripts/release/release-control-utils');
+  assert.equal(CANONICAL_REPOSITORY, 'Digital-Builders-757/mosaic-backend');
+  assert.equal(REPOSITORY, CANONICAL_REPOSITORY);
+  const root = path.resolve(__dirname, '../..');
+  const enforce = fs.readFileSync(path.join(root, '.github/workflows/enforce-staging-to-main.yml'), 'utf8');
+  assert.match(enforce, new RegExp(`const approvedRepository = '${CANONICAL_REPOSITORY}';`));
+  const gating = [
+    '.github/workflows/enforce-staging-to-main.yml',
+    '.github/workflows/deploy-eb-production.yml',
+    'scripts/release/build-production-evidence.js',
+    'scripts/release/verify-focused-release-source.js',
+    'scripts/release/verify-main-release-source.js',
+    'scripts/release/verify-checkout-surface-contract.js',
+  ];
+  for (const file of gating) {
+    assert.doesNotMatch(fs.readFileSync(path.join(root, file), 'utf8'), /Techware-Hut/i, file);
+  }
 });
 
 test('certificate binds protected branch, merged PR, current review, exact Git graph and source blobs', async () => {

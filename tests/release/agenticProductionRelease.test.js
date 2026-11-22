@@ -54,7 +54,7 @@ const {
 
 const shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
-const repository = 'Techware-Hut/mosaic-backend';
+const { CANONICAL_REPOSITORY: repository } = require('../../scripts/release/release-control-utils');
 
 const gateArnPrefix = 'arn:aws:elasticloadbalancing:us-east-1:123456789012:';
 const pinnedGateConfiguration = {
@@ -1026,7 +1026,10 @@ test('focused evidence keeps certification separate from deployment and rejects 
   });
   writeEvidenceFile(directory, 'checkout-surface.json', {
     status: 'passed', releaseMode: 'focused-baseline',
-    baselineProvenance: { verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA },
+    baselineProvenance: {
+      verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA,
+      releaseRef: 'refs/heads/release/focused/booking-filter', profile: 'dashboard-booking-filter',
+    },
   });
   writeEvidenceFile(directory, 'public-preflight.json', {
     mode: 'preflight', releaseMode: 'focused-baseline', expectedSha: shaA,
@@ -1049,6 +1052,28 @@ test('focused evidence keeps certification separate from deployment and rejects 
   assert.equal(evidence.deployment.attempted, false);
   assert.equal(evidence.focusedBaseline.externalGates.paymentLiability, 'not-proven');
   assert.equal(evidence.focusedBaseline.externalGates.protectedRefNoBypass, 'proven');
+
+  // Static route provenance must be bound to the same protected ref and profile.
+  const boundProvenance = {
+    verified: true, targetSha: shaA, baselineSha: FOCUSED_BASELINE_SHA,
+    releaseRef: 'refs/heads/release/focused/booking-filter', profile: 'dashboard-booking-filter',
+  };
+  for (const mismatch of [
+    { releaseRef: 'refs/heads/release/focused/contact-recaptcha' },
+    { profile: 'contact-recaptcha' },
+    { releaseRef: undefined },
+  ]) {
+    writeEvidenceFile(directory, 'checkout-surface.json', {
+      status: 'passed', releaseMode: 'focused-baseline',
+      baselineProvenance: { ...boundProvenance, ...mismatch },
+    });
+    assert.equal(buildProductionEvidence({
+      directory, releaseSha: shaA, releaseMode: 'focused-baseline', jobStatus: 'success',
+    }).failingPhase, 'focused-static-checkout-artifact');
+  }
+  writeEvidenceFile(directory, 'checkout-surface.json', {
+    status: 'passed', releaseMode: 'focused-baseline', baselineProvenance: boundProvenance,
+  });
 
   writeEvidenceFile(directory, 'aws-approved-preflight.json', { status: 'passed', releaseSha: shaA });
   writeEvidenceFile(directory, 'gate-enabled.json', { status: 'passed', gateState: 'active' });

@@ -34,7 +34,7 @@ jobs:
           const { execFileSync } = require('node:child_process');
 
           const repository = process.env.EXPECTED_REPOSITORY;
-          const approvedRepository = 'Techware-Hut/mosaic-backend';
+          const approvedRepository = 'Digital-Builders-757/mosaic-backend';
           const approvedBranch = 'codex/focused-release-wave1';
           const approvedBase = 'da890fbd6741ef2e4c618bed84ef0072ece7932d';
           const reviewedHead = 'd7ff8e041c7ffecd52043e844eb2dac76210e779';

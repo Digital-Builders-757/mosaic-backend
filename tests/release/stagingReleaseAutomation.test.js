@@ -52,7 +52,7 @@ const shaA = 'a'.repeat(40);
 const shaB = 'b'.repeat(40);
 const shaC = 'c'.repeat(40);
 const shaD = 'd'.repeat(40);
-const repository = 'Techware-Hut/mosaic-backend';
+const { CANONICAL_REPOSITORY: repository } = require('../../scripts/release/release-control-utils');
 const waveOneBase = 'da890fbd6741ef2e4c618bed84ef0072ece7932d';
 const waveOneCommits = [
   'af4146d524b393903a338c617f9d1eed7d42f56d',
@@ -900,7 +900,7 @@ test('candidate-controlled release text cannot inject markers, mentions, or code
 test('trusted controller publishes one App-owned status bound to candidate and main refs', async () => {
   const manifest = manifestFixture();
   const calls = [];
-  const targetUrl = 'https://github.com/Techware-Hut/mosaic-backend/actions/runs/500';
+  const targetUrl = `https://github.com/${repository}/actions/runs/500`;
   const request = async (_config, method, apiPath, body) => {
     calls.push({ method, apiPath, body });
     if (apiPath === '/git/ref/heads/staging') return { object: { sha: shaC } };

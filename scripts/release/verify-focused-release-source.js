@@ -5,8 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { githubRequestFactory } = require('./verify-main-release-source');
+const { CANONICAL_REPOSITORY } = require('./release-control-utils');
 
-const REPOSITORY = 'Techware-Hut/mosaic-backend';
+const REPOSITORY = CANONICAL_REPOSITORY;
 const BASELINE_SHA = '9bc75c257a9f483a287f122dbd38514b7a4b55d4';
 const FULL_SHA = /^[a-f0-9]{40}$/;
 const FOCUSED_REF = /^refs\/heads\/release\/focused\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -319,7 +320,7 @@ async function verifyFocusedReleaseSource({
   githubRequest,
   runGit = gitRunner,
 }) {
-  if (repository !== REPOSITORY) throw new Error('Focused release repository must be canonical Techware-Hut/mosaic-backend');
+  if (repository !== REPOSITORY) throw new Error(`Focused release repository must be canonical ${REPOSITORY}`);
   requireSha(releaseSha, 'releaseSha');
   requireSha(baselineSha, 'baselineSha');
   if (baselineSha !== BASELINE_SHA) throw new Error('Focused baseline differs from the approved production SHA');

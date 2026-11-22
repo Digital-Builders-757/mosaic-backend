@@ -14,7 +14,7 @@ const {
   verifyMainReleaseSource,
 } = require('../../scripts/release/verify-main-release-source');
 
-const repository = 'Techware-Hut/mosaic-backend';
+const { CANONICAL_REPOSITORY: repository } = require('../../scripts/release/release-control-utils');
 const mainSha = 'a'.repeat(40);
 const sourceSha = 'b'.repeat(40);
 const baselineSha = 'c'.repeat(40);
