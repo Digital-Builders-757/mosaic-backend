@@ -1446,7 +1446,7 @@ exports.addVariants = async (req, res) => {
     await Product.findByIdAndUpdate(productId, {
       $push: { variants: { $each: variantIds } },
     });
-    await recomputeProductPriceSummary(product._id, priceSummaryModels);
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
 
     return res.status(201).json({
       message: 'Variants added successfully',
