@@ -94,3 +94,13 @@ test('shipped email: hostile tracking URL falls back to the orders page in HTML 
   await mod.sendOrderUpdateEmail('customer@example.test', 'shipped', 'https://track.example.com/t?id=1&c=2', { firstName: 'C', orderNo: 'o1', trackingId: 't1' });
   assert.ok(hrefs(sent[0].html).includes('https://track.example.com/t?id=1&amp;c=2'));
 });
+
+test('normalizeUserHttpUrl: scheme-less vendor links become https; other schemes stay rejected', () => {
+  const { normalizeUserHttpUrl } = require('../../utils/emailTemplates/baseLayout');
+  assert.equal(normalizeUserHttpUrl('buy.stripe.com/abc'), 'https://buy.stripe.com/abc');
+  assert.equal(normalizeUserHttpUrl('  ups.com/track?n=1Z  '), 'https://ups.com/track?n=1Z');
+  assert.equal(normalizeUserHttpUrl('https://buy.stripe.com/x'), 'https://buy.stripe.com/x');
+  for (const value of ['javascript:alert(1)', 'data:text/html,x', '//evil.example/x', 'word', 'not a url', '', null, 'mailto:a@b.example']) {
+    assert.equal(normalizeUserHttpUrl(value), null, String(value));
+  }
+});

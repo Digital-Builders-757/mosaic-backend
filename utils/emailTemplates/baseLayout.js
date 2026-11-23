@@ -34,6 +34,22 @@ function safeHttpUrl(value) {
 }
 
 /**
+ * For links a vendor types into a form: like safeHttpUrl, but a value with no
+ * scheme at all ("buy.stripe.com/abc") is treated as https. Any explicit
+ * non-http(s) scheme (javascript:, data:, ...) is still rejected.
+ */
+function normalizeUserHttpUrl(value) {
+  const direct = safeHttpUrl(value);
+  if (direct) return direct;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed) || trimmed.startsWith('//')) return null;
+  const candidate = safeHttpUrl(`https://${trimmed}`);
+  // Require a dotted host so plain words don't become https://word/.
+  return candidate && new URL(candidate).hostname.includes('.') ? candidate : null;
+}
+
+/**
  * Escape HTML special characters to prevent XSS in email bodies.
  */
 function esc(s) {
@@ -213,4 +229,4 @@ function baseLayout({ preheader, bodyHtml, footerReason, logoUrl }) {
 </html>`;
 }
 
-module.exports = { baseLayout, esc, safeHttpUrl, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };
+module.exports = { baseLayout, esc, safeHttpUrl, normalizeUserHttpUrl, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };

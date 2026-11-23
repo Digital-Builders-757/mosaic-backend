@@ -11,7 +11,7 @@ const {
   sendCustomerServicePaymentRequestEmail,
   sendCustomerServiceBookingDecisionEmail,
 } = require('../utils/bookingMailer');
-const { safeHttpUrl } = require('../utils/emailTemplates/baseLayout');
+const { normalizeUserHttpUrl } = require('../utils/emailTemplates/baseLayout');
 const {
   resolveVendorBookingNotificationRecipients,
 } = require('../utils/notificationPreferenceGate');
@@ -368,7 +368,7 @@ exports.requestServiceBookingPayment = async (req, res) => {
     if (!paymentLink) {
       return res.status(400).json({ success: false, message: 'paymentLink is required' });
     }
-    const normalizedPaymentLink = safeHttpUrl(paymentLink);
+    const normalizedPaymentLink = normalizeUserHttpUrl(paymentLink);
     if (!normalizedPaymentLink) {
       return res.status(400).json({
         success: false,
