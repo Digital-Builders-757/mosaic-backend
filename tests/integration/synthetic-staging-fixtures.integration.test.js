@@ -15,9 +15,9 @@ const DB_NAME = 'mbh_fixture_it_staging';
 
 const EXPECTED_COUNTS = {
   User: 5,
-  VendorOnboardingStage1: 2,
-  Subscription: 3,
-  Business: 3,
+  VendorOnboardingStage1: 3,
+  Subscription: 4,
+  Business: 4,
   ProductCategory: 1,
   ProductSubcategory: 1,
   ServiceCategory: 1,
@@ -253,7 +253,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       assert.ok(food.bookingTimeSlots.length > 0);
 
       const businesses = await mongoose.model('Business').find({ fixtureTag: FIXTURE_TAG }).lean();
-      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'service']);
+      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'product', 'service']);
       for (const b of businesses) {
         assert.equal(b.stripeConnectAccountId, undefined);
         assert.equal(b.chargesEnabled, false);
@@ -287,6 +287,45 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       db.collection('users').find({ fixtureTag: FIXTURE_TAG }).sort({ _id: 1 }).toArray()
     );
     assert.deepEqual(after, snapshot);
+  });
+
+  it('--add-missing inserts only new fixture entries, leaves existing ones untouched, needs no password', async () => {
+    // Simulate an environment seeded before the Vendor B Goods entries existed.
+    const added = ['subscription.vendorB.product', 'business.vendorB.product', 'onboarding.vendorB'];
+    await withDb(async (db) => {
+      await db.collection('subscriptions').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[0] });
+      await db.collection('businesses').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[1] });
+      await db.collection('vendoronboardingstage1').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[2] });
+    });
+    const snapshot = await withDb(async (db) => {
+      const out = {};
+      for (const c of ['users', 'businesses', 'subscriptions', 'products', 'productvariants', 'vendoronboardingstage1']) {
+        out[c] = await db.collection(c).find({ fixtureTag: FIXTURE_TAG }).sort({ _id: 1 }).toArray();
+      }
+      return out;
+    });
+
+    // Without the flag the partial set is still refused.
+    const refused = await run(['--apply']);
+    assert.equal(refused.code, 1);
+    assert.match(refused.output, /FIXTURE_SET_PARTIAL/);
+
+    const { code, output } = await run(['--add-missing', '--apply'], { FIXTURE_PASSWORD: '' });
+    assert.equal(code, 0, output);
+    assert.match(output, /Applied: 3 created/);
+    assert.deepEqual(await collectionCounts({ fixtureTag: FIXTURE_TAG }), EXPECTED_COUNTS);
+
+    await withDb(async (db) => {
+      for (const [c, docs] of Object.entries(snapshot)) {
+        for (const doc of docs) {
+          assert.deepEqual(await db.collection(c).findOne({ _id: doc._id }), doc, `${c} ${doc.fixtureKey} unchanged`);
+        }
+      }
+      const biz = await db.collection('businesses').findOne({ fixtureKey: 'business.vendorB.product' });
+      assert.equal(biz.listingType, 'product');
+      assert.deepEqual(biz.products, []);
+      assert.equal(String(biz.owner), String(fixtureObjectId('user.vendorB')));
+    });
   });
 
   it('a partial fixture set blocks re-apply until cleanup; then apply restores consistent references', async () => {

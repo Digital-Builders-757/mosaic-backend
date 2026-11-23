@@ -157,7 +157,7 @@ async function loadExistingFixtures(models) {
  * @param {string} options.planName SubscriptionPlan name to attach
  * @param {string} [options.passwordHash] only needed for apply
  */
-async function buildPlan({ emails, mobiles, planName, passwordHash, now = new Date() }) {
+async function buildPlan({ emails, mobiles, planName, passwordHash, allowAdditive = false, now = new Date() }) {
   const models = loadModels();
   const spec = buildFixtureSpec();
   const existing = await loadExistingFixtures(models);
@@ -179,7 +179,10 @@ async function buildPlan({ emails, mobiles, planName, passwordHash, now = new Da
   }
 
   const existingCount = spec.filter((entry) => existing.has(entry.key)).length;
-  if (existingCount > 0 && existingCount < spec.length) {
+  // --add-missing: a partial set is allowed only when every existing fixture
+  // has its deterministic id (checked below); apply then inserts only the
+  // missing entries via $setOnInsert and never modifies existing documents.
+  if (existingCount > 0 && existingCount < spec.length && !allowAdditive) {
     blockers.push({
       code: 'FIXTURE_SET_PARTIAL',
       message: `${existingCount} of ${spec.length} fixture documents exist (partial set); run --cleanup first, then --apply`,

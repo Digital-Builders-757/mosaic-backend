@@ -13,6 +13,8 @@
  *   - food vendor with a food listing (dashboard R2 / R3 food parts).
  *   - vendor A service storefront with bookable offerings and hours (R1).
  *   - vendor A product storefront with stock-tracked variants (cart/stock).
+ *   - vendor B product storefront with no listings: a below-cap product vendor
+ *     for create/edit QA, so vendor A's fixture products stay untouched.
  *
  * No Stripe objects are referenced: Connect fields stay unset and the
  * subscription ids are synthetic placeholders, never Stripe ids.
@@ -275,7 +277,8 @@ function buildFixtureSpec() {
   entries.push(
     subscriptionEntry('subscription.vendorA.product', 'vendorA', 'business.vendorA.product'),
     subscriptionEntry('subscription.vendorA.service', 'vendorA', 'business.vendorA.service'),
-    subscriptionEntry('subscription.foodVendor', 'foodVendor', 'business.foodVendor')
+    subscriptionEntry('subscription.foodVendor', 'foodVendor', 'business.foodVendor'),
+    subscriptionEntry('subscription.vendorB.product', 'vendorB', 'business.vendorB.product')
   );
 
   entries.push(
@@ -317,6 +320,16 @@ function buildFixtureSpec() {
         foodCategories: [ctx.id('food.category')],
         usage: { totalFoods: 1 },
       }),
+    }),
+    businessEntry({
+      key: 'business.vendorB.product',
+      ownerRole: 'vendorB',
+      name: 'Vendor B Goods',
+      slug: 'mbh-synthetic-vendor-b-goods',
+      listingType: 'product',
+      subscriptionKey: 'subscription.vendorB.product',
+      // Starts empty (below the plan cap) for product create/edit QA.
+      refs: () => ({ products: [], usage: { totalProducts: 0 } }),
     })
   );
 
@@ -336,6 +349,14 @@ function buildFixtureSpec() {
       'food',
       'MBH-SYNTH-FOOD-VENDOR',
       `${NAME_PREFIX} Food Vendor Kitchen`
+    ),
+    onboardingEntry(
+      'onboarding.vendorB',
+      'vendorB',
+      'business.vendorB.product',
+      'product',
+      'MBH-SYNTH-VENDOR-B',
+      `${NAME_PREFIX} Vendor B Goods`
     )
   );
 
