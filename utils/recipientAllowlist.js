@@ -91,6 +91,22 @@ function isMailAddressAllowed(address, allowlist) {
   return allowlist.domains.some((suffix) => lower.endsWith(suffix));
 }
 
+/**
+ * Returns a copy of an *enforced* mail allowlist with extra exact addresses
+ * added, for one sender only (e.g. Contact Us -> its own inbox). Never widens
+ * an inactive or fail-closed (suppress_all_*) allowlist, and ignores anything
+ * that is not a single plain address (no @domain wildcards).
+ */
+function withExtraMailAddresses(allowlist, extras) {
+  if (!allowlist || !allowlist.active || allowlist.policy !== 'enforced') return allowlist;
+  const add = (Array.isArray(extras) ? extras : [])
+    .map((entry) => (typeof entry === 'string' ? entry.trim().toLowerCase() : ''))
+    .filter((entry) => EMAIL_PATTERN.test(entry));
+  if (add.length === 0) return allowlist;
+  const addresses = new Set([...allowlist.addresses, ...add]);
+  return { ...allowlist, addresses, size: addresses.size + allowlist.domains.length };
+}
+
 function isSmsNumberAllowed(number, allowlist) {
   return typeof number === 'string' && allowlist.numbers.has(number.trim());
 }
@@ -197,4 +213,5 @@ module.exports = {
   getSmsAllowlist,
   isMailAddressAllowed,
   isSmsNumberAllowed,
+  withExtraMailAddresses,
 };

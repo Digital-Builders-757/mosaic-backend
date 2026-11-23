@@ -183,7 +183,10 @@ test('contactInbox reports booleans only and checks the effective recipient agai
   // Falls back to ADMIN_EMAIL (admin@example.com), which is not allowlisted.
   assert.deepEqual(run({}), { explicit: false, allowlisted: false });
   assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'qa@example.com' }), { explicit: true, allowlisted: true });
-  assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'info@example.net' }), { explicit: true, allowlisted: false });
+  // An explicit inbox is allowed for Contact Us alone, without touching the shared list.
+  assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'info@example.net' }), { explicit: true, allowlisted: true });
+  // ...but never when the shared allowlist is fail-closed.
+  assert.deepEqual(run({ CONTACT_INBOX_EMAIL: 'info@example.net', MAIL_RECIPIENT_ALLOWLIST: '' }), { explicit: true, allowlisted: false });
   // Not hosted staging: allowlist inactive, so never reported as allowlisted.
   const prod = getIsolationSelfCheck({ env: { CONTACT_INBOX_EMAIL: 'qa@example.com' }, connection: null, getJobs: () => ({}) }).contactInbox;
   assert.deepEqual(prod, { explicit: true, allowlisted: false });

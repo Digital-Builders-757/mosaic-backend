@@ -16,8 +16,15 @@ function isContactInboxExplicit(env = process.env) {
   return trimmed(env[CONTACT_INBOX_ENV]) !== '';
 }
 
+// The only address Contact Us may add to the staging allowlist: the explicit
+// CONTACT_INBOX_EMAIL, never the ADMIN_EMAIL fallback.
+function getContactInboxAllowance(env = process.env) {
+  const explicit = trimmed(env[CONTACT_INBOX_ENV]);
+  return explicit ? [explicit] : [];
+}
+
 function getContactInboxEmail(env = process.env) {
   return trimmed(env[CONTACT_INBOX_ENV]) || trimmed(env.ADMIN_EMAIL) || undefined;
 }
 
-module.exports = { CONTACT_INBOX_ENV, getContactInboxEmail, isContactInboxExplicit };
+module.exports = { CONTACT_INBOX_ENV, getContactInboxAllowance, getContactInboxEmail, isContactInboxExplicit };
