@@ -7,7 +7,7 @@ const {
   formatMosaicFromHeader,
   isSuppressedMailResult,
 } = require("./smtpTransport");
-const { baseLayout, esc } = require("./emailTemplates/baseLayout");
+const { baseLayout, esc, safeHttpUrl } = require("./emailTemplates/baseLayout");
 
 const APP_NAME = process.env.APP_NAME || "Mosaic Biz Hub";
 const LOGO_URL = getFrontendLogoUrl();
@@ -446,7 +446,8 @@ async function sendOrderUpdateEmail(to, status, trackingUrl = null, details = {}
   const safeFirstName = esc(rawFirstName);
   const safeOrderNo = esc(orderNo);
   const safeTrackingId = esc(details.trackingId || 'N/A');
-  const safeTrackingUrl = trackingUrl || orderUrl;
+  // Vendor-supplied tracking link: only http(s), else the orders page.
+  const safeTrackingUrl = safeHttpUrl(trackingUrl) || orderUrl;
 
   if (status === "shipped") {
     const preheader = `Your order is on the way! Tracking Number: ${details.trackingId || 'N/A'}`;
@@ -498,7 +499,7 @@ async function sendOrderUpdateEmail(to, status, trackingUrl = null, details = {}
       <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 28px;border-collapse:collapse;">
         <tr>
           <td>
-            <a href="${safeTrackingUrl}"
+            <a href="${esc(safeTrackingUrl)}"
                style="display:inline-block;background:#2563EB;color:#ffffff;font-family:Arial,sans-serif;font-size:15px;font-weight:700;padding:14px 28px;border-radius:8px;text-decoration:none;letter-spacing:0.2px;">
               Track My Order &rarr;
             </a>

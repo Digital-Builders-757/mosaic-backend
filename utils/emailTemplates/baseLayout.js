@@ -14,6 +14,26 @@ const ACCENT_COLOR = '#7C3AED';      // Mosaic purple
 const FONT_STACK = "Arial, 'Helvetica Neue', Helvetica, sans-serif";
 
 /**
+ * Returns a normalized absolute http(s) URL, or null. Use for any link that
+ * comes from user input before it goes into an email href (then esc() it):
+ * blocks javascript:/data: schemes, embedded credentials and junk values.
+ */
+function safeHttpUrl(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 2048) return null;
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+  if (parsed.username || parsed.password) return null;
+  return parsed.href;
+}
+
+/**
  * Escape HTML special characters to prevent XSS in email bodies.
  */
 function esc(s) {
@@ -193,4 +213,4 @@ function baseLayout({ preheader, bodyHtml, footerReason, logoUrl }) {
 </html>`;
 }
 
-module.exports = { baseLayout, esc, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };
+module.exports = { baseLayout, esc, safeHttpUrl, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };
