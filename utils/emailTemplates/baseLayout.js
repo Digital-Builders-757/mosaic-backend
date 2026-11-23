@@ -14,6 +14,42 @@ const ACCENT_COLOR = '#7C3AED';      // Mosaic purple
 const FONT_STACK = "Arial, 'Helvetica Neue', Helvetica, sans-serif";
 
 /**
+ * Returns a normalized absolute http(s) URL, or null. Use for any link that
+ * comes from user input before it goes into an email href (then esc() it):
+ * blocks javascript:/data: schemes, embedded credentials and junk values.
+ */
+function safeHttpUrl(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 2048) return null;
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+  if (parsed.username || parsed.password) return null;
+  return parsed.href;
+}
+
+/**
+ * For links a vendor types into a form: like safeHttpUrl, but a value with no
+ * scheme at all ("buy.stripe.com/abc") is treated as https. Any explicit
+ * non-http(s) scheme (javascript:, data:, ...) is still rejected.
+ */
+function normalizeUserHttpUrl(value) {
+  const direct = safeHttpUrl(value);
+  if (direct) return direct;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed) || trimmed.startsWith('//')) return null;
+  const candidate = safeHttpUrl(`https://${trimmed}`);
+  // Require a dotted host so plain words don't become https://word/.
+  return candidate && new URL(candidate).hostname.includes('.') ? candidate : null;
+}
+
+/**
  * Escape HTML special characters to prevent XSS in email bodies.
  */
 function esc(s) {
@@ -193,4 +229,4 @@ function baseLayout({ preheader, bodyHtml, footerReason, logoUrl }) {
 </html>`;
 }
 
-module.exports = { baseLayout, esc, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };
+module.exports = { baseLayout, esc, safeHttpUrl, normalizeUserHttpUrl, BRAND_COLOR, BRAND_COLOR_DARK, ACCENT_COLOR, FONT_STACK, SUPPORT_EMAIL };

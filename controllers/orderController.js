@@ -89,6 +89,7 @@
 
 // controllers/orderController.js
 const mongoose = require("mongoose");
+const { normalizeUserHttpUrl } = require('../utils/emailTemplates/baseLayout');
 const { v4: uuidv4 } = require("uuid");
 const Stripe = require("stripe");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -1450,12 +1451,21 @@ exports.shipOrder = async (req, res) => {
   try {
     const vendorId = req.user._id;
     const orderId = req.params.orderId;
-    const { trackingId, trackingUrl, vendorNote } = req.body;
+    const { trackingId, trackingUrl: rawTrackingUrl, vendorNote } = req.body;
 
-    if (!trackingId || !trackingUrl) {
+    if (!trackingId || !rawTrackingUrl) {
       return res.status(400).json({
         success: false,
         message: "Tracking ID and URL are required",
+      });
+    }
+    // Stored, shown to the customer and sent by email/SMS: http(s) only.
+    const trackingUrl = normalizeUserHttpUrl(rawTrackingUrl);
+    if (!trackingUrl) {
+      return res.status(400).json({
+        success: false,
+        code: "TRACKING_URL_INVALID",
+        message: "Tracking URL must be a valid http(s) URL",
       });
     }
 

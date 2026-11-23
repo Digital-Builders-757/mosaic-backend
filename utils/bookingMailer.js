@@ -4,7 +4,7 @@ const {
   createMosaicTransport,
   formatMosaicFromHeader,
 } = require('./smtpTransport');
-const { baseLayout, esc } = require('./emailTemplates/baseLayout');
+const { baseLayout, esc, safeHttpUrl } = require('./emailTemplates/baseLayout');
 
 const transporter = createMosaicTransport(nodemailer);
 
@@ -586,6 +586,9 @@ exports.sendCustomerServicePaymentRequestEmail = async ({
 }) => {
   if (!to) return;
 
+  // Vendor-supplied link: only http(s), else the customer's bookings page.
+  const payHref = esc(safeHttpUrl(paymentLink) || buildFrontendUrl('/customer/bookings'));
+
   await transporter.sendMail({
     from: formatMosaicFromHeader(),
     to,
@@ -599,7 +602,7 @@ exports.sendCustomerServicePaymentRequestEmail = async ({
         <p><strong>Slot:</strong> ${safe(slot)}</p>
         ${message ? `<p><strong>Vendor note:</strong> ${safe(message)}</p>` : ''}
         <p>
-          <a href="${paymentLink}" style="display:inline-block;padding:10px 18px;background:#0d6efd;color:#fff;text-decoration:none;border-radius:4px;">
+          <a href="${payHref}" style="display:inline-block;padding:10px 18px;background:#0d6efd;color:#fff;text-decoration:none;border-radius:4px;">
             Pay Now
           </a>
         </p>

@@ -11,6 +11,7 @@ const {
   sendCustomerServicePaymentRequestEmail,
   sendCustomerServiceBookingDecisionEmail,
 } = require('../utils/bookingMailer');
+const { normalizeUserHttpUrl } = require('../utils/emailTemplates/baseLayout');
 const {
   resolveVendorBookingNotificationRecipients,
 } = require('../utils/notificationPreferenceGate');
@@ -367,8 +368,16 @@ exports.requestServiceBookingPayment = async (req, res) => {
     if (!paymentLink) {
       return res.status(400).json({ success: false, message: 'paymentLink is required' });
     }
+    const normalizedPaymentLink = normalizeUserHttpUrl(paymentLink);
+    if (!normalizedPaymentLink) {
+      return res.status(400).json({
+        success: false,
+        code: 'PAYMENT_LINK_INVALID',
+        message: 'paymentLink must be a valid http(s) URL',
+      });
+    }
 
-    booking.paymentLink = paymentLink;
+    booking.paymentLink = normalizedPaymentLink;
     booking.paymentRequestedAt = new Date();
     booking.vendorDecisionNote = note || '';
     booking.status = 'payment_requested';
@@ -384,7 +393,7 @@ exports.requestServiceBookingPayment = async (req, res) => {
         vendorName: vendor?.name || 'Vendor',
         date: formatBookingDate(booking.date),
         slot: booking.slot || booking.time,
-        paymentLink,
+        paymentLink: normalizedPaymentLink,
         bookingId: booking._id.toString(),
         message: note,
       });
