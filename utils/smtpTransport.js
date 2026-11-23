@@ -84,8 +84,16 @@ function applyMailRecipientAllowlist(transporter, { extraAllowedAddresses } = {}
     const { getMailAllowlist, filterMailOptions, withExtraMailAddresses } = require('./recipientAllowlist');
     // Per-sender extras (e.g. the Contact Us inbox) are evaluated
     // per send and only ever extend an already-enforced staging allowlist.
-    const extras = typeof extraAllowedAddresses === 'function' ? extraAllowedAddresses() : [];
-    const allowlist = withExtraMailAddresses(getMailAllowlist(), extras);
+    const baseAllowlist = getMailAllowlist();
+    let extras = [];
+    if (baseAllowlist.policy === 'enforced' && typeof extraAllowedAddresses === 'function') {
+      try {
+        extras = extraAllowedAddresses();
+      } catch {
+        extras = []; // a broken extra never widens or breaks delivery
+      }
+    }
+    const allowlist = withExtraMailAddresses(baseAllowlist, extras);
     if (!allowlist.active) {
       return originalSendMail.apply(this, args);
     }

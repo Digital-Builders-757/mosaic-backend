@@ -439,7 +439,21 @@ test('contact extra never widens a fail-closed allowlist and ignores wildcards/i
 
 test('contact extra is a no-op outside hosted staging', () =>
   withEnv({}, async () => {
-    const contact = senderWithExtras([]);
+    const contact = senderWithExtras(['inbox@example.net']);
     await contact.transporter.sendMail({ to: 'anyone@example.net' });
     assert.equal(contact.sent.length, 1);
+    assert.equal(contact.sent[0].to, 'anyone@example.net');
+  }));
+
+test('a throwing extra provider is ignored: no widening, no thrown send', () =>
+  withEnv({ RELEASE_ENVIRONMENT: 'staging', MAIL_RECIPIENT_ALLOWLIST: 'qa@example.com' }, async () => {
+    const warn = captureWarnings();
+    try {
+      const sent = [];
+      const t = applyMailRecipientAllowlist({ sendMail: async (m) => { sent.push(m); return {}; } },
+        { extraAllowedAddresses: () => { throw new Error('synthetic'); } });
+      assert.equal((await t.sendMail({ to: 'inbox@example.net' })).suppressed, true);
+      await t.sendMail({ to: 'qa@example.com' });
+      assert.equal(sent.length, 1);
+    } finally { warn.restore(); }
   }));
