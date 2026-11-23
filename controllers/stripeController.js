@@ -48,17 +48,47 @@ exports.createCheckoutSession = async (req, res) => {
   }
 };
 
-const endpointSecret = process.env.STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET;
+// /api/stripe/webhook receives two Stripe destinations with different signing
+// secrets: the platform destination (checkout.session.completed) signed with
+// STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET, and an optional connected-accounts
+// destination (account.updated) signed with
+// STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET. Each secret only accepts the
+// events its destination should send. With the connect secret unset,
+// behaviour is unchanged.
+function verifyBusinessDraftEvent(rawBody, sig, env = process.env, stripeClient = stripe) {
+  const platformSecret = env.STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET;
+  const connectSecret = String(env.STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET || '').trim();
+  let platformError;
+  try {
+    const event = stripeClient.webhooks.constructEvent(rawBody, sig, platformSecret);
+    if (event.account) {
+      throw new Error('Connected-account event received on the platform destination');
+    }
+    return { event };
+  } catch (err) {
+    platformError = err;
+  }
+  if (connectSecret) {
+    try {
+      const event = stripeClient.webhooks.constructEvent(rawBody, sig, connectSecret);
+      if (event.type !== 'account.updated' || !event.account) {
+        return { error: new Error('Unexpected event on the connected-accounts destination') };
+      }
+      return { event };
+    } catch (_err) {
+      // fall through to the platform error
+    }
+  }
+  return { error: platformError };
+}
+exports.verifyBusinessDraftEvent = verifyBusinessDraftEvent;
 
 exports.handleStripeWebhook = async (req, res) => {
   const sig = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
-  } catch (err) {
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  const { event, error } = verifyBusinessDraftEvent(req.body, sig);
+  if (error) {
+    console.error("Webhook signature verification failed:", error.message);
+    return res.status(400).send(`Webhook Error: ${error.message}`);
   }
 
   // Handle successful checkout session completion
