@@ -8,8 +8,8 @@
 const { isRecaptchaEnforced, getAllowedHostnames } = require('./recaptcha');
 const { isStagingEnv } = require('./frontendUrl');
 const { getReleaseEnvironment } = require('./releaseIdentity');
-const { getMailAllowlist, getSmsAllowlist, isMailAddressAllowed } = require('./recipientAllowlist');
-const { getContactInboxEmail, isContactInboxExplicit } = require('./contactInbox');
+const { getMailAllowlist, getSmsAllowlist, isMailAddressAllowed, withExtraMailAddresses } = require('./recipientAllowlist');
+const { getContactInboxAllowance, getContactInboxEmail, isContactInboxExplicit } = require('./contactInbox');
 
 const WEBHOOK_SECRET_ENVS = Object.freeze({
   order: 'STRIPE_ORDER_WEBHOOK_SECRET',
@@ -103,7 +103,8 @@ function getIsolationSelfCheck(options = {}) {
     // when the allowlist is not active).
     contactInbox: {
       explicit: isContactInboxExplicit(env),
-      allowlisted: mailAllowlist.active && isMailAddressAllowed(getContactInboxEmail(env), mailAllowlist),
+      allowlisted: mailAllowlist.active
+        && isMailAddressAllowed(getContactInboxEmail(env), withExtraMailAddresses(mailAllowlist, getContactInboxAllowance(env))),
     },
   };
 }
