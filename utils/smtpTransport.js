@@ -74,15 +74,26 @@ function isSuppressedMailResult(info) {
  * called with the original arguments unchanged. In hosted staging the guard
  * fails closed: an unset/blank/invalid allowlist suppresses every send.
  */
-function applyMailRecipientAllowlist(transporter) {
+function applyMailRecipientAllowlist(transporter, { extraAllowedAddresses } = {}) {
   if (!transporter || typeof transporter.sendMail !== 'function') {
     return transporter;
   }
   const originalSendMail = transporter.sendMail;
 
   transporter.sendMail = function sendMailWithAllowlist(...args) {
-    const { getMailAllowlist, filterMailOptions } = require('./recipientAllowlist');
-    const allowlist = getMailAllowlist();
+    const { getMailAllowlist, filterMailOptions, withExtraMailAddresses } = require('./recipientAllowlist');
+    // Per-sender extras (e.g. the Contact Us inbox) are evaluated
+    // per send and only ever extend an already-enforced staging allowlist.
+    const baseAllowlist = getMailAllowlist();
+    let extras = [];
+    if (baseAllowlist.policy === 'enforced' && typeof extraAllowedAddresses === 'function') {
+      try {
+        extras = extraAllowedAddresses();
+      } catch {
+        extras = []; // a broken extra never widens or breaks delivery
+      }
+    }
+    const allowlist = withExtraMailAddresses(baseAllowlist, extras);
     if (!allowlist.active) {
       return originalSendMail.apply(this, args);
     }
@@ -121,8 +132,8 @@ function applyMailRecipientAllowlist(transporter) {
  * the staging-only recipient allowlist guard). Call sites pass the nodemailer
  * module they already required so module-load-time binding is unchanged.
  */
-function createMosaicTransport(nodemailerImpl = require('nodemailer')) {
-  return applyMailRecipientAllowlist(nodemailerImpl.createTransport(buildSmtpTransportConfig()));
+function createMosaicTransport(nodemailerImpl = require('nodemailer'), options = {}) {
+  return applyMailRecipientAllowlist(nodemailerImpl.createTransport(buildSmtpTransportConfig()), options);
 }
 
 module.exports = {

@@ -41,6 +41,7 @@ const {
 const priceSummaryModels = { Product, ProductVariant };
 const { Decimal128 } = mongoose.Types;
 const s3Client = new S3Client(buildS3ClientConfig());
+const { toResponseSalePrice } = require('../lib/marketplace/listingPricePolicy');
 
 // Replaced product media may only be deleted from storage when it is an object
 // this vendor uploaded via GET /api/product/upload-url (or variant-upload-url):
@@ -399,11 +400,11 @@ exports.createProductWithVariants = async (req, res) => {
     );
     const galleryImageLimit = getGalleryImageLimit(subscriptionPlan);
 
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
+    // One new product = one listing slot, however many variants it has (#514).
     const usage = await countProductListingUsage({ Product, ProductVariant, businessId });
     const quotaCheck = assertProductListingQuota({
       total: usage.total,
-      incomingCount: 1 + incomingVariantCount,
+      incomingCount: 1,
       limit: productLimit,
     });
 
@@ -839,7 +840,7 @@ exports.getProductById = async (req, res) => {
       variants: variants.map(v => ({
         ...v,
         price: parseFloat(v.price?.toString() || '0'),
-        salePrice: parseFloat(v.salePrice?.toString() || '0'),
+        salePrice: toResponseSalePrice(v.salePrice),
       })),
     };
 
@@ -1392,24 +1393,8 @@ exports.addVariants = async (req, res) => {
       return res.status(404).json({ error: 'Subscription plan not found' });
     }
 
-    const productLimit = resolveProductListingLimit(
-      subscriptionPlan?.limits?.productListings || 0
-    );
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
-    const usage = await countProductListingUsage({
-      Product,
-      ProductVariant,
-      businessId: product.businessId,
-    });
-    const quotaCheck = assertProductListingQuota({
-      total: usage.total,
-      incomingCount: incomingVariantCount,
-      limit: productLimit,
-    });
-
-    if (!quotaCheck.ok) {
-      return res.status(quotaCheck.status).json({ error: quotaCheck.error });
-    }
+    // Adding variants to an existing product never uses a listing slot (#514),
+    // so there is no quota check here; the subscription checks above remain.
 
     // Create new variants with unique SKUs
     const variantDocs = [];
@@ -1675,7 +1660,7 @@ exports.getVariantById = async (req, res) => {
     const parsedVariant = {
       ...variant,
       price: parseFloat(variant.price?.toString() || '0'),
-      salePrice: parseFloat(variant.salePrice?.toString() || '0'),
+      salePrice: toResponseSalePrice(variant.salePrice),
     };
 
     return res.status(200).json({

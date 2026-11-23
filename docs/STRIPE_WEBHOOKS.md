@@ -22,6 +22,7 @@ Webhook routers also apply `express.raw()` on POST paths ([`routes/webhookRoutes
 |-------|------------|---------|---------------|----------|
 | `POST /api/webhooks/stripe` | `STRIPE_ORDER_WEBHOOK_SECRET` | `webhookController.handleStripeWebhook` | Marketplace **order payment status** | Order-related |
 | `POST /api/stripe/webhook` | `STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET` | `stripeController.handleStripeWebhook` | **Business draft checkout** + Connect account sync | Subscription / Connect |
+| `POST /api/stripe/webhook` (connected-accounts destination, optional) | `STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET` | `stripeController.handleStripeWebhook` | Connect `account.updated` only, from a *Connected accounts* destination; when set, the platform secret no longer accepts connected-account events. Subscribe this destination to `account.updated` only (other types return 400) | Connect |
 | `POST /api/subscription/webhook` | `STRIPE_SUBSCRIPTION_WEBHOOK_SECRET` | `webhookController.handleSubscriptionWebhook` | **Subscription billing lifecycle** | Subscription-related |
 | `POST /api/vendor-onboarding/webhook/payment` | `STRIPE_VENDOR_VERIFICATION_WEBHOOK_SECRET` | `vendorOnboarding.controller.handleVendorPaymentWebhook` | **Vendor Stage-1 $24.99 verification** | Vendor-onboarding |
 | `POST /api/stripe/payment/webhook` | `STRIPE_ORDER_POST_PAYMENT_WEBHOOK_SECRET` | `stripePaymentController.stripePaymentWebhook` | **Post-payment order enrichment + emails** | Post-payment / order-related |

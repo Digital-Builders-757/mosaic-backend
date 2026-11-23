@@ -1,3 +1,4 @@
+const { escapeRegex } = require('../utils/safeRegex');
 const mongoose = require('mongoose');
 const Service = require('../models/Service');
 const Review = require('../models/Review');
@@ -154,9 +155,9 @@ exports.getAllServices = async (req, res) => {
     // Search
     if (search) {
       filters.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { 'services.name': { $regex: search, $options: 'i' } },
+        { title: { $regex: escapeRegex(search), $options: 'i' } },
+        { description: { $regex: escapeRegex(search), $options: 'i' } },
+        { 'services.name': { $regex: escapeRegex(search), $options: 'i' } },
       ];
     }
 
@@ -540,8 +541,8 @@ exports.getAllFood = async (req, res) => {
     // Search filter
     if (search) {
       filters.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
+        { title: { $regex: escapeRegex(search), $options: 'i' } },
+        { description: { $regex: escapeRegex(search), $options: 'i' } },
       ];
     }
 
@@ -936,6 +937,7 @@ exports.getFoodById = async (req, res) => {
 
 
 const ProductVariant = require('../models/ProductVariant');
+const { toResponseSalePrice } = require('../lib/marketplace/listingPricePolicy');
 const Product = require('../models/Product');
 const ProductCategory = require('../models/ProductCategory');
 const ProductSubcategory = require('../models/ProductSubcategory');
@@ -1004,8 +1006,8 @@ exports.getAllProducts = async (req, res) => {
 
     if (search) {
       filters.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
+        { title: { $regex: escapeRegex(search), $options: 'i' } },
+        { description: { $regex: escapeRegex(search), $options: 'i' } },
       ];
     }
 
@@ -1158,8 +1160,8 @@ exports.getProductsByFilters = async (req, res) => {
 
     if (search) {
       filters.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
+        { title: { $regex: escapeRegex(search), $options: 'i' } },
+        { description: { $regex: escapeRegex(search), $options: 'i' } },
       ];
     }
 
@@ -1331,7 +1333,7 @@ exports.getProductById = async (req, res) => {
 
     const mappedVariants = variants.map(({ _id, ...rest }) => {
       const variantPrice = rest.price ? Number(rest.price) : 0;
-      const variantSalePrice = rest.salePrice ? Number(rest.salePrice) : null;
+      const variantSalePrice = toResponseSalePrice(rest.salePrice);
       const variantTaxPricing = buildTaxAwareAmounts({
         priceExclTax: variantPrice,
         salePriceExclTax: variantSalePrice,
@@ -1350,7 +1352,7 @@ exports.getProductById = async (req, res) => {
         sizes: Array.isArray(rest.sizes)
           ? rest.sizes.map((size) => {
               const sizePrice = size?.price ? Number(size.price) : 0;
-              const sizeSalePrice = size?.salePrice ? Number(size.salePrice) : null;
+              const sizeSalePrice = toResponseSalePrice(size?.salePrice);
               const sizeTaxPricing = buildTaxAwareAmounts({
                 priceExclTax: sizePrice,
                 salePriceExclTax: sizeSalePrice,

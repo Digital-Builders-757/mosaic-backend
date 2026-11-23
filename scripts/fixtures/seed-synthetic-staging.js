@@ -12,6 +12,10 @@
  * Usage:
  *   node scripts/fixtures/seed-synthetic-staging.js [--dry-run]      # default: print the plan
  *   node scripts/fixtures/seed-synthetic-staging.js --apply          # insert missing fixtures
+ *   node scripts/fixtures/seed-synthetic-staging.js --add-missing [--apply]
+ *       # allow a partial set (e.g. new fixture entries) when every existing fixture
+ *       # has its deterministic id; inserts only missing entries, never modifies
+ *       # existing ones; FIXTURE_PASSWORD only needed if a user must be created
  *   node scripts/fixtures/seed-synthetic-staging.js --cleanup        # cleanup preview (dry-run)
  *   node scripts/fixtures/seed-synthetic-staging.js --cleanup --apply   # delete (see Cleanup below)
  *   add --allow-orphans-report to let cleanup proceed / exit 0 when documents
@@ -94,10 +98,11 @@ const MIN_PASSWORD_LENGTH = 12;
 class UsageError extends Error {}
 
 function parseArgs(argv) {
-  const opts = { apply: false, cleanup: false, dryRun: false, allowOrphansReport: false, flags: {} };
+  const opts = { apply: false, cleanup: false, dryRun: false, allowOrphansReport: false, addMissing: false, flags: {} };
   for (const arg of argv) {
     if (arg === '--apply') opts.apply = true;
     else if (arg === '--allow-orphans-report') opts.allowOrphansReport = true;
+    else if (arg === '--add-missing') opts.addMissing = true;
     else if (arg === '--cleanup') opts.cleanup = true;
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg.startsWith('--') && arg.includes('=')) {
@@ -229,7 +234,14 @@ async function main({ argv = process.argv.slice(2), env = process.env, log = con
     throw err;
   }
 
-  if (opts.mode === 'apply') {
+  if (opts.addMissing && opts.cleanup) {
+    error('Refusing: --add-missing cannot be combined with --cleanup');
+    return 2;
+  }
+
+  // With --add-missing the password is only needed if a user must be created;
+  // that is checked after planning.
+  if (opts.mode === 'apply' && !opts.addMissing) {
     const password = env.FIXTURE_PASSWORD || '';
     if (password.length < MIN_PASSWORD_LENGTH) {
       error(`Refusing to apply: FIXTURE_PASSWORD must be set (min ${MIN_PASSWORD_LENGTH} chars)`);
@@ -275,11 +287,20 @@ async function main({ argv = process.argv.slice(2), env = process.env, log = con
       }
     }
 
+    const hasPassword = String(env.FIXTURE_PASSWORD || '').length >= MIN_PASSWORD_LENGTH;
     const passwordHash =
-      opts.mode === 'apply' ? await bcrypt.hash(env.FIXTURE_PASSWORD, 12) : undefined;
+      opts.mode === 'apply' && hasPassword ? await bcrypt.hash(env.FIXTURE_PASSWORD, 12) : undefined;
     const planName = String(env.FIXTURE_SUBSCRIPTION_PLAN || 'Launch Plan').trim();
 
-    const plan = await buildPlan({ emails, mobiles, planName, passwordHash });
+    const plan = await buildPlan({ emails, mobiles, planName, passwordHash, allowAdditive: opts.addMissing });
+    if (
+      opts.mode === 'apply' &&
+      !passwordHash &&
+      plan.entries.some((e) => e.action === 'create' && e.model === 'User')
+    ) {
+      error(`Refusing to apply: creating user fixtures requires FIXTURE_PASSWORD (min ${MIN_PASSWORD_LENGTH} chars)`);
+      return 2;
+    }
 
     log('Plan:');
     for (const entry of plan.entries) {

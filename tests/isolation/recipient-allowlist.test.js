@@ -388,3 +388,72 @@ test('mail: a fully allowed string recipient field is passed through verbatim', 
     assert.equal(sent[0].to, '"QA" <qa@example.com>, ops@example.com');
     assert.deepEqual(addresses(sent[0].cc), ['qa@example.com']);
   }));
+
+// ── Contact Us: per-sender extra recipient (CONTACT_INBOX_EMAIL) ───────────
+
+function senderWithExtras(extras) {
+  const sent = [];
+  const transporter = applyMailRecipientAllowlist({
+    sendMail: async (message) => { sent.push(message); return { messageId: 'm-1' }; },
+  }, { extraAllowedAddresses: () => extras });
+  return { transporter, sent };
+}
+
+test('contact extra: only the sender given the extra may reach it; shared allowlist unchanged', () =>
+  withEnv({ RELEASE_ENVIRONMENT: 'staging', MAIL_RECIPIENT_ALLOWLIST: 'qa@example.com' }, async () => {
+    const warn = captureWarnings();
+    try {
+      const contact = senderWithExtras(['Inbox@Example.net']);
+      const info = await contact.transporter.sendMail({ to: 'inbox@example.net', subject: 's' });
+      assert.equal(contact.sent.length, 1);
+      assert.equal(info.suppressed, undefined);
+
+      // Any other sender (no extras) is still blocked from the same address.
+      const other = fakeTransporter();
+      const blocked = await other.transporter.sendMail({ to: 'inbox@example.net', subject: 's' });
+      assert.equal(other.sent.length, 0);
+      assert.equal(blocked.suppressed, true);
+
+      // The extra does not open up anything else for the contact sender.
+      const leak = await contact.transporter.sendMail({ to: 'someone@example.net', subject: 's' });
+      assert.equal(leak.suppressed, true);
+      assert.equal(contact.sent.length, 1);
+    } finally { warn.restore(); }
+  }));
+
+test('contact extra never widens a fail-closed allowlist and ignores wildcards/invalid entries', () =>
+  withEnv({ RELEASE_ENVIRONMENT: 'staging' }, async () => {
+    const warn = captureWarnings();
+    try {
+      const unset = senderWithExtras(['inbox@example.net']);
+      assert.equal((await unset.transporter.sendMail({ to: 'inbox@example.net' })).suppressed, true);
+      assert.equal(unset.sent.length, 0);
+      process.env.MAIL_RECIPIENT_ALLOWLIST = ' , ';
+      assert.equal((await unset.transporter.sendMail({ to: 'inbox@example.net' })).suppressed, true);
+      process.env.MAIL_RECIPIENT_ALLOWLIST = 'qa@example.com';
+      const wild = senderWithExtras(['@example.net', 'not-an-address', 'A <inbox@example.net>']);
+      assert.equal((await wild.transporter.sendMail({ to: 'inbox@example.net' })).suppressed, true);
+      assert.equal(wild.sent.length, 0);
+    } finally { warn.restore(); }
+  }));
+
+test('contact extra is a no-op outside hosted staging', () =>
+  withEnv({}, async () => {
+    const contact = senderWithExtras(['inbox@example.net']);
+    await contact.transporter.sendMail({ to: 'anyone@example.net' });
+    assert.equal(contact.sent.length, 1);
+    assert.equal(contact.sent[0].to, 'anyone@example.net');
+  }));
+
+test('a throwing extra provider is ignored: no widening, no thrown send', () =>
+  withEnv({ RELEASE_ENVIRONMENT: 'staging', MAIL_RECIPIENT_ALLOWLIST: 'qa@example.com' }, async () => {
+    const warn = captureWarnings();
+    try {
+      const sent = [];
+      const t = applyMailRecipientAllowlist({ sendMail: async (m) => { sent.push(m); return {}; } },
+        { extraAllowedAddresses: () => { throw new Error('synthetic'); } });
+      assert.equal((await t.sendMail({ to: 'inbox@example.net' })).suppressed, true);
+      await t.sendMail({ to: 'qa@example.com' });
+      assert.equal(sent.length, 1);
+    } finally { warn.restore(); }
+  }));

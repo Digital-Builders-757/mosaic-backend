@@ -4,8 +4,13 @@ const {
   createMosaicTransport,
   formatMosaicFromHeader,
 } = require('../utils/smtpTransport');
+const { getContactInboxAllowance, getContactInboxEmail } = require('../utils/contactInbox');
 
-const transporter = createMosaicTransport(nodemailer);
+// On hosted staging this sender alone may also reach the explicit
+// CONTACT_INBOX_EMAIL; the shared MAIL_RECIPIENT_ALLOWLIST is unchanged.
+const transporter = createMosaicTransport(nodemailer, {
+  extraAllowedAddresses: () => getContactInboxAllowance(),
+});
 
 // Contact form input is untrusted: escape it before it goes into admin email HTML.
 const escapeHtml = (value) =>
@@ -38,7 +43,7 @@ exports.createContactInquiry = async (req, res) => {
     try {
       const mailOptions = {
         from: formatMosaicFromHeader(),
-        to: process.env.ADMIN_EMAIL,
+        to: getContactInboxEmail(),
         subject: toHeaderText(`New Contact Inquiry: ${subject}`),
         html: `
           <h2>New Contact Inquiry</h2>
