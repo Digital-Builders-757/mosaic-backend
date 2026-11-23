@@ -56,6 +56,7 @@ test('getIsolationSelfCheck returns the documented shape with booleans/enums onl
       order: true,
       subscription: false,
       businessDraft: false,
+      businessDraftConnect: false,
       orderPostPayment: false,
       vendorVerification: false,
     },

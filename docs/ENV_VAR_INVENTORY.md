@@ -57,6 +57,7 @@ Sources compared: [`.env.example`](../.env.example), [README.md](../README.md), 
 | `STRIPE_SECRET_KEY` | Required-prod | Yes | All Stripe API |
 | `STRIPE_ORDER_WEBHOOK_SECRET` | Required-prod | Yes | `POST /api/webhooks/stripe` |
 | `STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET` | Required-prod | Yes | `POST /api/stripe/webhook` |
+| `STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET` | Optional | Yes | `POST /api/stripe/webhook`: signing secret of a separate *Connected accounts* destination (`account.updated` only). Unset = platform secret alone, as before |
 | `STRIPE_SUBSCRIPTION_WEBHOOK_SECRET` | Required-prod | Yes | `POST /api/subscription/webhook` |
 | `STRIPE_VENDOR_VERIFICATION_WEBHOOK_SECRET` | Required-prod | Yes | `POST /api/vendor-onboarding/webhook/payment` |
 | `STRIPE_ORDER_POST_PAYMENT_WEBHOOK_SECRET` | Required-prod | Yes | `POST /api/stripe/payment/webhook` |
