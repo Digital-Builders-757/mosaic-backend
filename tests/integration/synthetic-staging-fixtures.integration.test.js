@@ -15,9 +15,9 @@ const DB_NAME = 'mbh_fixture_it_staging';
 
 const EXPECTED_COUNTS = {
   User: 5,
-  VendorOnboardingStage1: 2,
-  Subscription: 3,
-  Business: 3,
+  VendorOnboardingStage1: 3,
+  Subscription: 4,
+  Business: 4,
   ProductCategory: 1,
   ProductSubcategory: 1,
   ServiceCategory: 1,
@@ -253,7 +253,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       assert.ok(food.bookingTimeSlots.length > 0);
 
       const businesses = await mongoose.model('Business').find({ fixtureTag: FIXTURE_TAG }).lean();
-      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'service']);
+      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'product', 'service']);
       for (const b of businesses) {
         assert.equal(b.stripeConnectAccountId, undefined);
         assert.equal(b.chargesEnabled, false);
