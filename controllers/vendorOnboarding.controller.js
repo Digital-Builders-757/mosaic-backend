@@ -307,7 +307,11 @@ exports.saveDraft = async (req, res) => {
     }
     // 8️⃣ Save (conditional on the status we read; see statusAsRead)
     if (!onboarding.isNew) {
-      onboarding.$where = { status: statusAsRead };
+      // Legacy records with no stored status load as the schema default
+      // 'draft'; match a missing field too so they are not locked out.
+      onboarding.$where = {
+        status: statusAsRead === 'draft' ? { $in: ['draft', null] } : statusAsRead,
+      };
     }
     try {
       await onboarding.save();

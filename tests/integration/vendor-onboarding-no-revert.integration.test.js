@@ -141,6 +141,47 @@ test('control: create-payment still reports already paid before the status guard
   const { controller, calls } = loadController();
   const out = res();
   await controller.createVerificationPayment({ user: { _id: user._id } }, out);
-  assert.notEqual(out.statusCode, 409);
+  assert.equal(out.statusCode, 400);
+  assert.equal(out.body.code, 'ALREADY_PAID');
   assert.equal(calls.stripe, 0);
+});
+
+for (const status of ['draft', 'payment_pending', 'rejected']) {
+  test(`control: a ${status} application still gets a verification payment`, async () => {
+    const user = await vendor();
+    const seeded = await seedVendorOnboarding(user, { status, verificationPayment: { status: 'not_started' } });
+    const created = [];
+    const originalLoad = Module._load;
+    Module._load = function mockLoad(request, parent, isMain) {
+      if (request === 'stripe') return () => ({ paymentIntents: {
+        retrieve: async () => { throw new Error('unexpected retrieve'); },
+        create: async (args) => { created.push(args); return { id: `pi_ok_${status}`, client_secret: 'cs_test_synthetic', status: 'requires_payment_method' }; },
+        cancel: async () => {},
+      } });
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    delete require.cache[controllerPath];
+    let controller;
+    try { controller = require(controllerPath); } finally { Module._load = originalLoad; }
+    const out = res();
+    await controller.createVerificationPayment({ user: { _id: user._id } }, out);
+    assert.equal(out.statusCode, 200, JSON.stringify(out.body));
+    assert.equal(created.length, 1);
+    assert.equal(created[0].amount, 2499);
+    const after = await VendorOnboarding.findById(seeded._id).lean();
+    assert.equal(after.status, 'payment_pending');
+    assert.equal(after.verificationPayment.paymentIntentId, `pi_ok_${status}`);
+  });
+}
+
+test('legacy record with no stored status can still save a draft', async () => {
+  const user = await vendor();
+  const seeded = await seedVendorOnboarding(user, { status: 'draft' });
+  await VendorOnboarding.collection.updateOne({ _id: seeded._id }, { $unset: { status: 1 } });
+  const { controller } = loadController();
+  const out = res();
+  await controller.saveDraft({ user: { _id: user._id }, body: { businessName: 'Legacy Fix LLC' } }, out);
+  assert.equal(out.statusCode, 200, JSON.stringify(out.body));
+  const after = await VendorOnboarding.findById(seeded._id).lean();
+  assert.equal(after.businessName, 'Legacy Fix LLC');
 });
