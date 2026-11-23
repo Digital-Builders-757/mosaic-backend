@@ -394,11 +394,11 @@ exports.createProductWithVariants = async (req, res) => {
     );
     const galleryImageLimit = getGalleryImageLimit(subscriptionPlan);
 
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
+    // One new product = one listing slot, however many variants it has (#514).
     const usage = await countProductListingUsage({ Product, ProductVariant, businessId });
     const quotaCheck = assertProductListingQuota({
       total: usage.total,
-      incomingCount: 1 + incomingVariantCount,
+      incomingCount: 1,
       limit: productLimit,
     });
 
@@ -1399,24 +1399,8 @@ exports.addVariants = async (req, res) => {
       return res.status(404).json({ error: 'Subscription plan not found' });
     }
 
-    const productLimit = resolveProductListingLimit(
-      subscriptionPlan?.limits?.productListings || 0
-    );
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
-    const usage = await countProductListingUsage({
-      Product,
-      ProductVariant,
-      businessId: product.businessId,
-    });
-    const quotaCheck = assertProductListingQuota({
-      total: usage.total,
-      incomingCount: incomingVariantCount,
-      limit: productLimit,
-    });
-
-    if (!quotaCheck.ok) {
-      return res.status(quotaCheck.status).json({ error: quotaCheck.error });
-    }
+    // Adding variants to an existing product never uses a listing slot (#514),
+    // so there is no quota check here; the subscription checks above remain.
 
     // Create new variants with unique SKUs
     const variantDocs = [];
