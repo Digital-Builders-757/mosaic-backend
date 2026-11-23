@@ -54,14 +54,14 @@ exports.createCheckoutSession = async (req, res) => {
 // destination (account.updated) signed with
 // STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET. Each secret only accepts the
 // events its destination should send. With the connect secret unset,
-// behaviour is unchanged.
+// behaviour is unchanged: the platform secret alone verifies every event.
 function verifyBusinessDraftEvent(rawBody, sig, env = process.env, stripeClient = stripe) {
   const platformSecret = env.STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET;
   const connectSecret = String(env.STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET || '').trim();
   let platformError;
   try {
     const event = stripeClient.webhooks.constructEvent(rawBody, sig, platformSecret);
-    if (event.account) {
+    if (connectSecret && event.account) {
       throw new Error('Connected-account event received on the platform destination');
     }
     return { event };

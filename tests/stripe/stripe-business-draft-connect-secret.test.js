@@ -29,9 +29,27 @@ test('connected-account account.updated verifies with the connect secret', () =>
   assert.equal(verifyBusinessDraftEvent(body, sig, BOTH, stripe).event.type, 'account.updated');
 });
 
-test('connect secret unset: connected-account event is rejected (unchanged behaviour)', () => {
+test('connect secret unset: platform-signed connected-account event is still accepted (unchanged behaviour)', () => {
+  const { body, sig } = signed(acctUpd, PLATFORM);
+  assert.equal(verifyBusinessDraftEvent(body, sig, { STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET: PLATFORM }, stripe).event.type, 'account.updated');
+});
+
+test('connect secret unset: connect-signed event is rejected', () => {
   const { body, sig } = signed(acctUpd, CONNECT);
   assert.ok(verifyBusinessDraftEvent(body, sig, { STRIPE_BUSINESS_DRAFT_WEBHOOK_SECRET: PLATFORM }, stripe).error);
+});
+
+test('connect-signed account.updated without an account field is rejected', () => {
+  const { account, ...noAccount } = acctUpd;
+  const { body, sig } = signed(noAccount, CONNECT);
+  assert.ok(verifyBusinessDraftEvent(body, sig, BOTH, stripe).error);
+});
+
+test('whitespace around the connect secret is tolerated', () => {
+  const { body, sig } = signed(acctUpd, CONNECT);
+  const env = { ...BOTH, STRIPE_BUSINESS_DRAFT_CONNECT_WEBHOOK_SECRET: `  ${CONNECT}
+` };
+  assert.equal(verifyBusinessDraftEvent(body, sig, env, stripe).event.type, 'account.updated');
 });
 
 test('connect secret accepts only account.updated', () => {
