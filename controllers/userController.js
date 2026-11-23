@@ -7,6 +7,7 @@ const {
     sendWelcomeEmail,
     sendPasswordResetOtpEmail,
 } = require('../utils/mailer');
+const { sendOtpSMS, sendCustomerWelcomeSMS } = require('../utils/telnyxService');
 const {
     getCookieOptions,
     clearCookie,
@@ -14,6 +15,7 @@ const {
     clearAuthCookies,
 } = require('../utils/cookieHelper');
 const toPublicAuthUser = require('../utils/toPublicAuthUser');
+const { resolveSessionPolicy, jwtClaims, jwtSignOptions } = require('../utils/sessionPolicy');
 
 function getSafePublicRole(role) {
     return role === 'business_owner' ? 'business_owner' : 'customer';
@@ -25,9 +27,10 @@ function buildSessionToken(user) {
             sub: user._id.toString(),
             role: user.role,
             sessionVersion: user.sessionVersion || 0,
+            ...jwtClaims('session'),
         },
         process.env.JWT_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn: '7d', ...jwtSignOptions('session') }
     );
 }
 
@@ -102,7 +105,7 @@ function respondOtpDeliveryFailed(res, context, { user } = {}) {
 
     if (context === 'register') {
         body.accountCreated = true;
-        res.cookie('otpPending', 'true', getCookieOptions(10 * 60 * 1000));
+        res.cookie(resolveSessionPolicy().cookieNames.otpPending, 'true', getCookieOptions(10 * 60 * 1000));
     }
 
     return res.status(502).json(body);
@@ -122,6 +125,7 @@ exports.registerUser = async (req, res) => {
     }
 
     try {
+        const sessionPolicy = resolveSessionPolicy();
         const { name, email, password, role, mobile, gender, minorityType } = req.body;
         const safeRole = getSafePublicRole(role);
 
@@ -152,19 +156,27 @@ exports.registerUser = async (req, res) => {
         await newUser.save();
 
         try {
-            await sendOtpEmail(email, otp, 'register');
-        } catch (emailError) {
-            logOtpDeliveryFailure('register', emailError);
+            const firstName = name ? name.split(' ')[0] : '';
+            if (email) {
+                await sendOtpEmail(email, otp, 'register', firstName, safeRole);
+            }
+            if (mobile) {
+                await sendOtpSMS({ to: mobile, otp });
+            }
+        } catch (deliveryError) {
+            logOtpDeliveryFailure('register', deliveryError);
             return respondOtpDeliveryFailed(res, 'register', {
-                user: { email, role: safeRole },
+                user: { email, mobile, role: safeRole },
             });
         }
 
-        res.cookie('otpPending', 'true', getCookieOptions(10 * 60 * 1000));
+        res.cookie(sessionPolicy.cookieNames.otpPending, 'true', getCookieOptions(10 * 60 * 1000));
 
         return res.status(201).json({
             success: true,
-            message: 'User registered successfully. OTP sent to email.',
+            message: email
+                ? 'User registered successfully. OTP sent to email.'
+                : 'User registered successfully. OTP sent.',
         });
     } catch (err) {
         console.error('Registration error:', err);
@@ -180,10 +192,16 @@ exports.registerUser = async (req, res) => {
 };
 
 exports.verifyOtp = async (req, res) => {
-    const { email, otp } = req.body;
+    const { email, mobile, otp } = req.body;
 
     try {
-        const user = await User.findOne({ email });
+        resolveSessionPolicy();
+        const query = email ? { email } : (mobile ? { mobile } : null);
+        if (!query) {
+            return res.status(400).json({ success: false, message: 'Email or mobile is required' });
+        }
+
+        const user = await User.findOne(query);
         if (!user || !user.otp || !user.otpExpiry) {
             return res.status(400).json({
                 success: false,
@@ -215,9 +233,21 @@ exports.verifyOtp = async (req, res) => {
 
         try {
             const firstName = user.name.split(' ')[0];
-            await sendWelcomeEmail(user.email, firstName, user.role);
+            if (user.email) {
+                await sendWelcomeEmail(user.email, firstName, user.role);
+            }
         } catch (emailError) {
             console.error('Failed to send welcome email:', emailError);
+        }
+
+        // 1C — Send welcome SMS (non-blocking, customer only)
+        if (user.mobile && user.role !== 'business_owner') {
+            sendCustomerWelcomeSMS({
+                to: user.mobile,
+                firstName: user.name ? user.name.split(' ')[0] : undefined,
+            }).catch((smsErr) =>
+                console.error('[Telnyx SMS] Welcome SMS failed:', smsErr.message)
+            );
         }
 
         const token = buildSessionToken(user);
@@ -238,10 +268,16 @@ exports.verifyOtp = async (req, res) => {
 };
 
 exports.resendOtp = async (req, res) => {
-    const { email } = req.body;
+    const { email, mobile } = req.body;
 
     try {
-        const user = await User.findOne({ email });
+        const sessionPolicy = resolveSessionPolicy();
+        const query = email ? { email } : (mobile ? { mobile } : null);
+        if (!query) {
+            return res.status(400).json({ success: false, message: 'Email or mobile is required' });
+        }
+
+        const user = await User.findOne(query);
         if (!user) {
             return res.status(404).json({ success: false, message: 'User not found' });
         }
@@ -267,13 +303,19 @@ exports.resendOtp = async (req, res) => {
         await user.save();
 
         try {
-            await sendOtpEmail(user.email, otp, 'resend');
-        } catch (emailError) {
-            logOtpDeliveryFailure('resend', emailError);
+            const firstName = user.name ? user.name.split(' ')[0] : '';
+            if (user.email) {
+                await sendOtpEmail(user.email, otp, 'resend', firstName, user.role);
+            }
+            if (user.mobile) {
+                await sendOtpSMS({ to: user.mobile, otp });
+            }
+        } catch (deliveryError) {
+            logOtpDeliveryFailure('resend', deliveryError);
             return respondOtpDeliveryFailed(res, 'resend', { user });
         }
 
-        res.cookie('otpPending', 'true', getCookieOptions(10 * 60 * 1000));
+        res.cookie(sessionPolicy.cookieNames.otpPending, 'true', getCookieOptions(10 * 60 * 1000));
 
         return res.status(200).json({
             success: true,
@@ -310,7 +352,8 @@ exports.forgotPassword = async (req, res) => {
         await user.save();
 
         try {
-            await sendPasswordResetOtpEmail(user.email, otp);
+            const firstName = user.name ? user.name.split(' ')[0] : '';
+            await sendPasswordResetOtpEmail(user.email, otp, firstName);
         } catch (emailError) {
             logOtpDeliveryFailure('passwordReset', emailError);
             return res.status(200).json(FORGOT_PASSWORD_RESPONSE);
@@ -402,6 +445,7 @@ exports.loginUser = async (req, res) => {
     }
 
     try {
+        const sessionPolicy = resolveSessionPolicy();
         const { email, password } = req.body;
 
         const user = await User.findOne({ email });
@@ -432,13 +476,14 @@ exports.loginUser = async (req, res) => {
             await user.save();
 
             try {
-                await sendOtpEmail(user.email, otp, 'unverifiedLogin');
+                const firstName = user.name ? user.name.split(' ')[0] : '';
+                await sendOtpEmail(user.email, otp, 'unverifiedLogin', firstName, user.role);
             } catch (emailError) {
                 logOtpDeliveryFailure('unverifiedLogin', emailError);
                 return respondOtpDeliveryFailed(res, 'unverifiedLogin', { user });
             }
 
-            res.cookie('otpPending', 'true', getCookieOptions(10 * 60 * 1000));
+            res.cookie(sessionPolicy.cookieNames.otpPending, 'true', getCookieOptions(10 * 60 * 1000));
 
             return res.status(403).json({
                 success: false,
@@ -468,8 +513,10 @@ exports.loginUser = async (req, res) => {
 };
 
 exports.logout = (req, res) => {
+    const sessionPolicy = resolveSessionPolicy();
     clearAuthCookies(res);
     clearCookie(res, 'otpPending');
+    if (sessionPolicy.staging) clearCookie(res, 'mbh_tmp');
 
     res.status(200).json({ message: 'Logged out successfully' });
 };

@@ -44,6 +44,8 @@ function buildOnboarding(overrides = {}) {
     },
     acceptedTerms: true,
     declarationAccepted: true,
+    hasBusinessLicense: true,
+    licenseNumber: '123456789',
     isMinorityOwned: false,
     status: 'draft',
     badge: null,
@@ -62,6 +64,12 @@ function loadController(onboarding) {
   process.env.ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@example.com';
 
   const vendorOnboardingMock = {
+    findOneAndUpdate: async (filter, update) => {
+      if (!filter.status.$in.includes(onboarding.status)) return null;
+      Object.assign(onboarding, update.$set);
+      for (const key of Object.keys(update.$unset)) delete onboarding[key];
+      return onboarding;
+    },
     findOne: async () => onboarding,
   };
 

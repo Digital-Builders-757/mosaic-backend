@@ -18,6 +18,7 @@ const {
 } = require('../utils/syncBusinessFromOnboarding');
 const { validateStage1Payload } = require('../utils/vendorOnboardingValidation');
 const { deliverVendorOnboardingEmails } = require('../utils/vendorOnboardingEmailDelivery');
+const { sendVendorProfileCompleteSMS } = require('../utils/telnyxService');
 
 function logVendorOnboardingEvent(endpoint, req, onboarding, { httpStatus, category, message }) {
   const payload = {
@@ -147,13 +148,53 @@ exports.saveDraft = async (req, res) => {
 
     // 1️⃣ Check if onboarding exists
     let onboarding = await VendorOnboarding.findOne({ userId });
+    // Status as read. The save below only applies if it is unchanged, so a
+    // concurrent submit/approval can never be reverted by a stale draft save.
+    const statusAsRead = onboarding ? (onboarding.status ?? null) : undefined;
 
-    // 2️⃣ ❌ Block ONLY if verified (not submitted)
+    // 1b️⃣ Raw API boundary validation for hasBusinessLicense before model operations
+    if (payload.hasBusinessLicense !== undefined && typeof payload.hasBusinessLicense !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'hasBusinessLicense must be a boolean (true or false)',
+      });
+    }
+
+    // 2️⃣ ❌ Lock editing if application is verified
     if (onboarding && onboarding.status === "verified") {
       return res.status(400).json({
         success: false,
         message: "Application already verified and cannot be edited",
       });
+    }
+
+    // 2b️⃣ ❌ Block modifying approval-sensitive fields while application is under admin review
+    if (onboarding && ["submitted", "under_review"].includes(onboarding.status)) {
+      const sensitiveFields = [
+        "hasBusinessLicense",
+        "licenseNumber",
+        "noLicenseComplianceConfirmed",
+        "declarationAccepted",
+        "acceptedTerms",
+        "isMinorityOwned",
+        "minorityCategories",
+        "minorityProofDocuments",
+        "taxDocuments",
+        "businessLicenseDocuments",
+        "refundPolicyDocument",
+        "termsDocument",
+        "einNumber",
+        "ssnLast9"
+      ];
+      const attemptsSensitiveMutation = sensitiveFields.some(
+        (field) => payload[field] !== undefined
+      );
+      if (attemptsSensitiveMutation) {
+        return res.status(400).json({
+          success: false,
+          message: `Application is currently ${onboarding.status} and approval-sensitive fields cannot be edited`,
+        });
+      }
     }
 
     // 3️⃣ Create new onboarding if it doesn't exist
@@ -206,6 +247,18 @@ exports.saveDraft = async (req, res) => {
       }
     });
 
+    // 6b️⃣ Enforce mutual exclusivity per diagram:
+    // YES path: clear noLicenseComplianceConfirmed so vendor can't hold both states.
+    // NO path: authoritatively clear stale license evidence so DB can never hold
+    // a contradictory state (hasBusinessLicense:false with a licenseNumber or docs).
+    if (onboarding.hasBusinessLicense === true) {
+      onboarding.noLicenseComplianceConfirmed = false;
+    } else if (onboarding.hasBusinessLicense === false) {
+      // 6c️⃣ Server-side normalization: wipe license evidence on NO path
+      onboarding.licenseNumber = '';
+      onboarding.businessLicenseDocuments = [];
+    }
+
     // 7️⃣ Default fields
     const defaultFields = {
       firstName: "",
@@ -252,8 +305,26 @@ exports.saveDraft = async (req, res) => {
     } else if (!onboarding.status) {
       onboarding.status = 'draft';
     }
-    // 8️⃣ Save
-    await onboarding.save();
+    // 8️⃣ Save (conditional on the status we read; see statusAsRead)
+    if (!onboarding.isNew) {
+      // Legacy records with no stored status load as the schema default
+      // 'draft'; match a missing field too so they are not locked out.
+      onboarding.$where = {
+        status: statusAsRead === 'draft' ? { $in: ['draft', null] } : statusAsRead,
+      };
+    }
+    try {
+      await onboarding.save();
+    } catch (saveError) {
+      if (saveError?.name === 'DocumentNotFoundError') {
+        return res.status(409).json({
+          success: false,
+          code: 'APPLICATION_STATE_CHANGED',
+          message: 'Your application changed while saving. Please reload and try again.',
+        });
+      }
+      throw saveError;
+    }
 
     return res.status(200).json({
       success: true,
@@ -584,15 +655,13 @@ exports.getOnboardingData = async (req, res) => {
 
 /**
  * Update entire business profile (PUT)
- * This updates ALL fields - NO STATUS CHECKS
+ * Allowlist-filtered update with status guard.
  */
 
 exports.updateBusinessProfile = async (req, res) => {
   try {
     const userId = req.user._id;
     const payload = req.body;
-
-    const VendorOnboarding = require('../models/VendorOnboardingStage1');
 
     // 1️⃣ Check existing onboarding
     let onboarding = await VendorOnboarding.findOne({ userId });
@@ -602,6 +671,40 @@ exports.updateBusinessProfile = async (req, res) => {
         success: false,
         message: "No onboarding draft found. Please save draft first.",
       });
+    }
+
+    // 1b️⃣ Block approval-sensitive field MUTATIONS when submitted, under_review, or verified.
+    // Field presence alone is not enough — the frontend always sends the full payload on
+    // every profile save (including unchanged fields). We only block when the incoming
+    // value genuinely differs from the stored value.
+    if (['submitted', 'under_review', 'verified'].includes(onboarding.status)) {
+      const profileSensitiveFields = [
+        'hasBusinessLicense',
+        'licenseNumber',
+        'noLicenseComplianceConfirmed',
+        'declarationAccepted',
+        'acceptedTerms',
+        'isMinorityOwned',
+        'minorityCategories',
+        'minorityProofDocuments',
+        'taxDocuments',
+        'businessLicenseDocuments',
+        'refundPolicyDocument',
+        'termsDocument',
+        'einNumber',
+        'ssnLast9',
+      ];
+      const isValueChanged = (incoming, existing) =>
+        JSON.stringify(incoming) !== JSON.stringify(existing);
+      const attemptsSensitiveMutation = profileSensitiveFields.some(
+        (field) => payload[field] !== undefined && isValueChanged(payload[field], onboarding[field])
+      );
+      if (attemptsSensitiveMutation) {
+        return res.status(400).json({
+          success: false,
+          message: `Application is currently ${onboarding.status} and approval-sensitive fields cannot be edited`,
+        });
+      }
     }
 
     // 2️⃣ Update onboarding with allowlisted profile fields only
@@ -654,6 +757,22 @@ exports.updateBusinessProfile = async (req, res) => {
           applicationId: onboarding.applicationId,
           businessName: onboarding.businessName,
         });
+
+        // 2C — Send vendor profile complete SMS (non-blocking)
+        const mongoose = require("mongoose");
+        const profileUser = req.user?.mobile
+          ? req.user
+          : (mongoose.connection?.readyState === 1
+              ? await User.findById(userId).select('mobile name').lean()
+              : null);
+        if (profileUser?.mobile) {
+          sendVendorProfileCompleteSMS({
+            to: profileUser.mobile,
+            vendorName: profileUser.name ? profileUser.name.split(' ')[0] : onboarding.businessName,
+          }).catch((smsErr) =>
+            console.error('[Telnyx SMS] Profile complete SMS failed:', smsErr.message)
+          );
+        }
 
         onboarding.profileCompletionNotifiedAt = new Date();
         await onboarding.save();
@@ -763,7 +882,7 @@ exports.updateBusinessProfile = async (req, res) => {
 // };
 
 /**
- * Patch business profile - NO STATUS CHECKS
+ * Patch business profile - allowlist-filtered with status guard.
  */
 exports.patchBusinessProfile = async (req, res) => {
   try {
@@ -781,7 +900,39 @@ exports.patchBusinessProfile = async (req, res) => {
       });
     }
 
-    // ✅ NO STATUS CHECKS - Always allow updates
+    // 2b️⃣ Block approval-sensitive field MUTATIONS when submitted, under_review, or verified.
+    // Field presence alone is not enough — the frontend always sends the full payload on
+    // every profile save (including unchanged fields). We only block when the incoming
+    // value genuinely differs from the stored value.
+    if (['submitted', 'under_review', 'verified'].includes(onboarding.status)) {
+      const profileSensitiveFields = [
+        'hasBusinessLicense',
+        'licenseNumber',
+        'noLicenseComplianceConfirmed',
+        'declarationAccepted',
+        'acceptedTerms',
+        'isMinorityOwned',
+        'minorityCategories',
+        'minorityProofDocuments',
+        'taxDocuments',
+        'businessLicenseDocuments',
+        'refundPolicyDocument',
+        'termsDocument',
+        'einNumber',
+        'ssnLast9',
+      ];
+      const isValueChanged = (incoming, existing) =>
+        JSON.stringify(incoming) !== JSON.stringify(existing);
+      const attemptsSensitiveMutation = profileSensitiveFields.some(
+        (field) => payload[field] !== undefined && isValueChanged(payload[field], onboarding[field])
+      );
+      if (attemptsSensitiveMutation) {
+        return res.status(400).json({
+          success: false,
+          message: `Application is currently ${onboarding.status} and approval-sensitive fields cannot be edited`,
+        });
+      }
+    }
 
     // 3️⃣ Only update allowlisted profile fields
     applyVendorBusinessProfileFields(onboarding, payload);
@@ -846,53 +997,114 @@ exports.patchBusinessProfile = async (req, res) => {
 
 
 
-async function reconcileVendorVerificationPaymentFromStripe(onboarding, userId) {
+// Returns { paid, onboarding }; callers must use the returned document, which
+// may be a fresh read after the conditional payment_pending transition.
+// `retrievedIntent` lets a caller that already retrieved the stored
+// PaymentIntent skip a second Stripe call; it is validated the same way.
+async function reconcileVendorVerificationPaymentFromStripe(onboarding, userId, retrievedIntent = null) {
   if (onboarding.verificationPayment?.status === 'paid') {
-    return true;
+    return { paid: true, onboarding };
   }
 
   const paymentIntentId = onboarding.verificationPayment?.paymentIntentId;
   if (!paymentIntentId) {
-    return false;
+    return { paid: false, onboarding };
   }
 
-  let paymentIntent;
-  try {
-    paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-  } catch (error) {
-    console.error('Vendor verification payment retrieve failed:', error.message);
-    return false;
+  let paymentIntent = retrievedIntent;
+  if (!paymentIntent) {
+    try {
+      paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    } catch (error) {
+      console.error('Vendor verification payment retrieve failed:', error.message);
+      return { paid: false, onboarding };
+    }
   }
 
   if (paymentIntent.status !== 'succeeded') {
-    return false;
+    return { paid: false, onboarding };
   }
 
   if (paymentIntent.metadata?.type !== 'vendor_verification') {
-    return false;
+    return { paid: false, onboarding };
   }
 
   if (paymentIntent.metadata?.userId !== userId.toString()) {
-    return false;
+    return { paid: false, onboarding };
   }
 
   if (paymentIntent.id !== paymentIntentId) {
-    return false;
+    return { paid: false, onboarding };
+  }
+
+  if (onboarding.status === 'payment_pending') {
+    const paymentFields = {
+      'verificationPayment.status': 'paid',
+      'verificationPayment.paidAt': onboarding.verificationPayment.paidAt || new Date(),
+      status: 'draft',
+    };
+    // Preserve the save hook's badge normalization without a stale status save.
+    if (onboarding.badge === 'Bronze') paymentFields.badge = 'Silver';
+    await VendorOnboarding.updateOne(
+      {
+        _id: onboarding._id,
+        status: 'payment_pending',
+        'verificationPayment.paymentIntentId': paymentIntentId,
+      },
+      { $set: paymentFields },
+      { runValidators: true }
+    );
+    // Another request may already have reconciled and submitted this record.
+    const refreshed = await VendorOnboarding.findById(onboarding._id);
+    if (!refreshed) return { paid: false, onboarding };
+    return { paid: refreshed.verificationPayment?.status === 'paid', onboarding: refreshed };
   }
 
   onboarding.verificationPayment.status = 'paid';
   if (!onboarding.verificationPayment.paidAt) {
     onboarding.verificationPayment.paidAt = new Date();
   }
-  if (onboarding.status === 'payment_pending') {
-    onboarding.status = 'draft';
-  }
   await onboarding.save();
 
-  return true;
+  return { paid: true, onboarding };
 }
 
 //payment controllers
+
+// Existing "already paid" contract (status and message unchanged); `code` is additive.
+function respondAlreadyPaid(res) {
+  return res.status(400).json({
+    success: false,
+    code: 'ALREADY_PAID',
+    message: "Verification fee already paid"
+  });
+}
+
+// Used when a conditional write in createVerificationPayment loses a race:
+// re-read and report what actually won.
+async function respondWithCurrentPaymentState(res, onboardingId) {
+  const current = await VendorOnboarding.findById(onboardingId);
+  if (current?.verificationPayment?.status === 'paid') {
+    return respondAlreadyPaid(res);
+  }
+  return res.status(409).json({
+    success: false,
+    code: 'PAYMENT_STATE_CHANGED',
+    message: "Verification payment state changed. Please retry.",
+    data: {
+      status: current?.verificationPayment?.status || 'not_started',
+      applicationStatus: current?.status || null,
+      applicationId: current?.applicationId || "N/A"
+    }
+  });
+}
+
+function isStripeResourceMissing(error) {
+  return error?.code === 'resource_missing' || error?.statusCode === 404;
+}
+
+const PAYABLE_APPLICATION_STATUSES = Object.freeze(["draft", "payment_pending", "rejected"]);
+
 exports.createVerificationPayment = async (req, res) => {
   try {
     const userId = req.user._id;
@@ -907,10 +1119,109 @@ exports.createVerificationPayment = async (req, res) => {
     }
 
     if (onboarding.verificationPayment?.status === "paid") {
-      return res.status(400).json({
+      return respondAlreadyPaid(res);
+    }
+
+    // A submitted or verified application must never be moved back to
+    // payment_pending (e.g. legacy records submitted before payment existed).
+    if (!PAYABLE_APPLICATION_STATUSES.includes(onboarding.status)) {
+      return res.status(409).json({
         success: false,
-        message: "Verification fee already paid"
+        code: 'APPLICATION_NOT_PAYABLE',
+        message: "This application is not awaiting a verification payment."
       });
+    }
+
+    // Reuse existing unpaid PaymentIntent if still active on Stripe (idempotent recovery)
+    const storedIntentId = onboarding.verificationPayment?.paymentIntentId;
+    if (storedIntentId) {
+      let existingIntent = null;
+      try {
+        existingIntent = await stripe.paymentIntents.retrieve(storedIntentId);
+      } catch (retrieveError) {
+        if (!isStripeResourceMissing(retrieveError)) {
+          // We cannot tell whether the stored PaymentIntent was paid; never
+          // replace it blindly.
+          console.error(
+            "Could not retrieve existing payment intent from Stripe:",
+            retrieveError.message
+          );
+          return res.status(503).json({
+            success: false,
+            code: 'PAYMENT_PROVIDER_UNAVAILABLE',
+            message: "Payment provider is temporarily unavailable. Please retry."
+          });
+        }
+        console.warn(
+          "Existing payment intent not found on Stripe, proceeding to create new:",
+          retrieveError.message
+        );
+      }
+
+      if (existingIntent?.status === "succeeded") {
+        const isForeignIntent =
+          existingIntent.metadata?.type !== 'vendor_verification' ||
+          existingIntent.metadata?.userId !== userId.toString();
+        if (!isForeignIntent) {
+          // Paid on Stripe but the webhook has not landed yet: record the
+          // payment instead of replacing the PaymentIntent, which would orphan
+          // the charge and make the late webhook miss this record.
+          let paid = false;
+          try {
+            ({ paid } = await reconcileVendorVerificationPaymentFromStripe(
+              onboarding,
+              userId,
+              existingIntent
+            ));
+          } catch (reconcileError) {
+            console.error("Vendor verification payment reconcile failed:", { onboardingId: String(onboarding._id), paymentIntentId: existingIntent?.id, error: reconcileError.message });
+          }
+          if (paid) {
+            return respondAlreadyPaid(res);
+          }
+          // Never create a second PaymentIntent over a succeeded one.
+          return res.status(409).json({
+            success: false,
+            code: 'PAYMENT_CONFIRMING',
+            message: "Payment is being confirmed. Please retry."
+          });
+        }
+        // Foreign metadata: not this vendor's payment; create a new one.
+      } else if (existingIntent && existingIntent.status !== "canceled") {
+        // Conditional write instead of a stale save(): a webhook that marked
+        // this PaymentIntent paid (and moved the record to draft) after our
+        // read must not be flipped back to payment_pending. A record already
+        // moved to payment_pending (e.g. a double-click) still matches.
+        const reuseFields = { status: "payment_pending" };
+        // updateOne skips validate hooks; preserve legacy badge normalization.
+        if (onboarding.badge === "Bronze") reuseFields.badge = "Silver";
+        const reuseResult = await VendorOnboarding.updateOne(
+          {
+            _id: onboarding._id,
+            status: { $in: [...new Set([onboarding.status, "payment_pending"])] },
+            "verificationPayment.status": { $ne: "paid" },
+            "verificationPayment.paymentIntentId": storedIntentId,
+          },
+          { $set: reuseFields },
+          { runValidators: true }
+        );
+        if (!reuseResult?.matchedCount) {
+          return await respondWithCurrentPaymentState(res, onboarding._id);
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: "Payment intent retrieved successfully. Complete payment to continue.",
+          data: {
+            clientSecret: existingIntent.client_secret,
+            amount: 24.99,
+            currency: "usd",
+            status: "pending",
+            applicationStatus: "payment_pending",
+            applicationId: onboarding.applicationId || "N/A"
+          }
+        });
+      }
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
@@ -924,20 +1235,44 @@ exports.createVerificationPayment = async (req, res) => {
       description: 'Vendor Onboarding Verification Fee - $24.99'
     });
 
-    onboarding.verificationPayment = {
-      provider: 'stripe',
-      paymentIntentId: paymentIntent.id,
-      amount: 24.99,
-      amount_cents: 2499,
-      currency: 'usd',
-      status: 'pending',
-      paidAt: null
+    const createFields = {
+      verificationPayment: {
+        provider: 'stripe',
+        paymentIntentId: paymentIntent.id,
+        amount: 24.99,
+        amount_cents: 2499,
+        currency: 'usd',
+        status: 'pending',
+        paidAt: null
+      },
+      status: 'payment_pending',
     };
+    // updateOne skips validate hooks; preserve legacy badge normalization.
+    if (onboarding.badge === 'Bronze') createFields.badge = 'Silver';
 
-    onboarding.status = 'payment_pending';
-    onboarding.submittedAt = undefined;
-
-    await onboarding.save();
+    // Conditional write instead of a stale save(): only replace the payment
+    // if the record is still as we read it (same status and PaymentIntent, not
+    // paid). A webhook or /submit landing in between must win.
+    const createResult = await VendorOnboarding.updateOne(
+      {
+        _id: onboarding._id,
+        status: onboarding.status,
+        'verificationPayment.status': { $ne: 'paid' },
+        'verificationPayment.paymentIntentId': onboarding.verificationPayment?.paymentIntentId ?? null,
+      },
+      { $set: createFields, $unset: { submittedAt: 1 } },
+      { runValidators: true }
+    );
+    if (!createResult?.matchedCount) {
+      // Lost the race. The new PaymentIntent's client secret is never
+      // returned; cancel it best-effort and report the current state.
+      try {
+        await stripe.paymentIntents.cancel(paymentIntent.id);
+      } catch (cancelError) {
+        console.warn("Could not cancel unused payment intent:", cancelError.message);
+      }
+      return await respondWithCurrentPaymentState(res, onboarding._id);
+    }
 
     return res.status(200).json({
       success: true,
@@ -947,7 +1282,8 @@ exports.createVerificationPayment = async (req, res) => {
         amount: 24.99,
         currency: 'usd',
         status: 'pending',
-        applicationStatus: 'payment_pending'
+        applicationStatus: 'payment_pending',
+        applicationId: onboarding.applicationId || "N/A"
       }
     });
 
@@ -1005,17 +1341,44 @@ exports.handleVendorPaymentWebhook = async (req, res) => {
           });
 
           if (onboarding) {
-            onboarding.verificationPayment.status = 'paid';
-            onboarding.verificationPayment.paidAt = new Date();
-            // Only demote payment-in-progress apps. Never yank submitted /
+            // Conditional updates instead of load-then-save: a concurrent
+            // /submit may move this record to 'submitted' after our read, and
+            // a stale save() would revert it to draft.
+            const paymentMatch = {
+              _id: onboarding._id,
+              'verificationPayment.paymentIntentId': paymentIntent.id,
+            };
+            // (a) Mark paid once; duplicate deliveries keep the original paidAt.
+            const paidResult = await VendorOnboarding.updateOne(
+              { ...paymentMatch, 'verificationPayment.status': { $ne: 'paid' } },
+              { $set: { 'verificationPayment.status': 'paid', 'verificationPayment.paidAt': new Date() } },
+              { runValidators: true }
+            );
+            // (b) Only demote payment-in-progress apps. Never yank submitted /
             // rejected / verified applications back to draft on a late webhook.
-            if (onboarding.status === 'payment_pending') {
-              onboarding.status = 'draft';
+            // Intentionally NOT gated on (a) modifying anything: a record that
+            // is already paid but still payment_pending self-repairs to draft.
+            const draftResult = await VendorOnboarding.updateOne(
+              { ...paymentMatch, status: 'payment_pending' },
+              { $set: { status: 'draft' } },
+              { runValidators: true }
+            );
+            // updateOne skips validate hooks; preserve legacy badge normalization.
+            if (onboarding.badge === 'Bronze') {
+              await VendorOnboarding.updateOne(
+                { _id: onboarding._id, badge: 'Bronze' },
+                { $set: { badge: 'Silver' } }
+              );
             }
 
-            await onboarding.save();
-
             console.log(`Vendor verification payment succeeded for user ${userId}`);
+            const paidModified = paidResult?.modifiedCount ?? 0;
+            const draftModified = draftResult?.modifiedCount ?? 0;
+            console.log(
+              `Vendor verification webhook ${paymentIntent.id}: paid matched=${paidResult?.matchedCount ?? 0} modified=${paidModified}; ` +
+              `draft matched=${draftResult?.matchedCount ?? 0} modified=${draftModified}` +
+              (paidModified === 0 && draftModified === 0 ? ' (duplicate/no-op)' : '')
+            );
           } else {
             console.log(`No onboarding record found for payment ${paymentIntent.id}`);
           }
@@ -1040,12 +1403,25 @@ exports.handleVendorPaymentWebhook = async (req, res) => {
           });
 
           if (onboarding) {
-            onboarding.verificationPayment.status = 'failed';
-            onboarding.status = 'payment_pending';
-
-            await onboarding.save();
+            // Conditional update: never unmark a paid payment or pull a
+            // submitted / verified / rejected application back to payment_pending.
+            const failedResult = await VendorOnboarding.updateOne(
+              {
+                _id: onboarding._id,
+                'verificationPayment.paymentIntentId': failedPaymentIntent.id,
+                'verificationPayment.status': { $ne: 'paid' },
+                status: { $in: ['draft', 'payment_pending'] },
+              },
+              { $set: { 'verificationPayment.status': 'failed', status: 'payment_pending' } },
+              { runValidators: true }
+            );
 
             console.log(`Vendor verification payment failed for user ${userId}`);
+            const failedModified = failedResult?.modifiedCount ?? 0;
+            console.log(
+              `Vendor verification webhook ${failedPaymentIntent.id}: failed matched=${failedResult?.matchedCount ?? 0} modified=${failedModified}` +
+              (failedModified === 0 ? ' (no-op: already paid, past payment stage, or duplicate)' : '')
+            );
           }
         } catch (error) {
           console.error('Failed to update vendor verification payment failure:', error);
@@ -1070,7 +1446,7 @@ exports.getPaymentStatus = async (req, res) => {
   try {
     const userId = req.user._id;
     
-    const onboarding = await VendorOnboarding.findOne({ userId });
+    let onboarding = await VendorOnboarding.findOne({ userId });
     
     if (!onboarding) {
       logVendorOnboardingEvent('GET /stage1/payment-status', req, null, {
@@ -1085,7 +1461,7 @@ exports.getPaymentStatus = async (req, res) => {
     }
 
     if (onboarding.verificationPayment?.status !== 'paid') {
-      await reconcileVendorVerificationPaymentFromStripe(onboarding, userId);
+      ({ onboarding } = await reconcileVendorVerificationPaymentFromStripe(onboarding, userId));
     }
 
     const paymentData = {
@@ -1130,7 +1506,7 @@ exports.submitForReview = async (req, res) => {
   try {
     const userId = req.user._id;
 
-    const onboarding = await VendorOnboarding.findOne({ userId });
+    let onboarding = await VendorOnboarding.findOne({ userId });
 
     /* ------------------------------
        BASIC EXISTENCE CHECK
@@ -1184,9 +1560,12 @@ if (
     /* ------------------------------
        PAYMENT VALIDATION (MANDATORY)
     ------------------------------ */
-    const paymentReady =
-      onboarding.verificationPayment?.status === 'paid' ||
-      (await reconcileVendorVerificationPaymentFromStripe(onboarding, userId));
+    let paymentReady = onboarding.verificationPayment?.status === 'paid';
+    if (!paymentReady) {
+      const reconciled = await reconcileVendorVerificationPaymentFromStripe(onboarding, userId);
+      paymentReady = reconciled.paid;
+      onboarding = reconciled.onboarding;
+    }
 
     if (!paymentReady) {
       logVendorOnboardingEvent('POST /submit', req, onboarding, {
@@ -1198,6 +1577,15 @@ if (
         success: false,
         message: "Verification payment must be completed before submission",
       });
+    }
+
+    /* ------------------------------
+       SERVER-SIDE LICENSE NORMALIZATION (NO PATH)
+       Run before validation so the validator sees a clean record.
+    ------------------------------ */
+    if (onboarding.hasBusinessLicense === false) {
+      onboarding.licenseNumber = '';
+      onboarding.businessLicenseDocuments = [];
     }
 
     /* ------------------------------
@@ -1221,14 +1609,41 @@ if (
     /* ------------------------------
        FINAL SUBMISSION
     ------------------------------ */
-    onboarding.status = "submitted";
-    onboarding.submittedAt = new Date();
-    // Clear stale rejection UI once the app is back in the review queue.
-    onboarding.reviewDecision = undefined;
-    onboarding.rejectionReason = undefined;
-    onboarding.requiredNextAction = undefined;
-    onboarding.rejectedAt = undefined;
-    await onboarding.save();
+    const submitFields = { status: 'submitted', submittedAt: new Date() };
+    // findOneAndUpdate skips validate hooks; preserve badge normalization (applicationId is immutable and assigned on first save).
+    if (onboarding.badge === 'Bronze') submitFields.badge = 'Silver';
+    if (onboarding.hasBusinessLicense === false) {
+      submitFields.licenseNumber = '';
+      submitFields.businessLicenseDocuments = [];
+    }
+    const submitted = await VendorOnboarding.findOneAndUpdate(
+      { userId, status: { $in: ['draft', 'payment_pending', 'rejected'] } },
+      {
+        $set: submitFields,
+        $unset: {
+          reviewDecision: 1,
+          rejectionReason: 1,
+          requiredNextAction: 1,
+          rejectedAt: 1,
+        },
+      },
+      { new: true, runValidators: true }
+    );
+    if (!submitted) {
+      // receiptEmail is unknown for the idempotent loser, not a delivery failure.
+      logVendorOnboardingEvent('POST /submit', req, onboarding, {
+        httpStatus: 200,
+        category: 'success',
+        message: 'Idempotent resubmit',
+      });
+      return res.status(200).json({
+        success: true,
+        message: "Application submitted successfully",
+        applicationId: onboarding.applicationId,
+      });
+    }
+
+    onboarding = submitted;
 
     /* ------------------------------
        FETCH USER DETAILS
@@ -1263,10 +1678,19 @@ if (
       category: 'success',
     });
 
+    const receipt = emailDelivery.results.find(
+      (result) => result.label === 'vendor_submission_confirmation'
+    );
+
     return res.status(200).json({
       success: true,
       message: "Stage 1 submitted successfully for admin verification",
       applicationId: onboarding.applicationId,
+      receiptEmail: {
+        sent: Boolean(receipt?.sent),
+        skipped: Boolean(receipt?.skipped),
+        failed: Boolean(receipt && !receipt.sent && !receipt.skipped),
+      },
       emailSent: emailDelivery.emailSent,
       emailSkipped: emailDelivery.emailSkipped,
       emailFailed: emailDelivery.emailFailed,

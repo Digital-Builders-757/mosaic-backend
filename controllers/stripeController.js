@@ -6,6 +6,8 @@ const Business = require("../models/Business");
 const { sendWelcomeEmail } = require("../utils/WellcomeMailer");
 const { ensurePlanPrice } = require('../helpers/stripePlan');
 const { buildFrontendUrl } = require('../utils/frontendUrl');
+const { exactCaseInsensitiveRegex } = require('../utils/safeRegex');
+const { triggerTierWelcomeNotifications } = require('../utils/vendorTierWelcomeEmail');
 
 exports.createCheckoutSession = async (req, res) => {
   try {
@@ -125,14 +127,14 @@ exports.handleStripeWebhook = async (req, res) => {
       // Check for business name conflict
       let businessName = draft.businessName;
       let existingBusiness = await Business.findOne({
-        businessName: { $regex: new RegExp(`^${businessName}$`, "i") },
+        businessName: { $regex: exactCaseInsensitiveRegex(businessName) },
       });
 
       let counter = 1;
       while (existingBusiness) {
         businessName = `${draft.businessName}-${counter}`;
         existingBusiness = await Business.findOne({
-          businessName: { $regex: new RegExp(`^${businessName}$`, "i") },
+          businessName: { $regex: exactCaseInsensitiveRegex(businessName) },
         });
         counter++;
       }
@@ -194,6 +196,7 @@ exports.handleStripeWebhook = async (req, res) => {
           : `Business created successfully.`;
 
       sendWelcomeEmail(business.email, businessName);
+      triggerTierWelcomeNotifications(newSubscription);
       return res.status(200).json({
         message: responseMessage,
         business,

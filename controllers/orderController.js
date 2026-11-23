@@ -89,6 +89,7 @@
 
 // controllers/orderController.js
 const mongoose = require("mongoose");
+const { normalizeUserHttpUrl } = require('../utils/emailTemplates/baseLayout');
 const { v4: uuidv4 } = require("uuid");
 const Stripe = require("stripe");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -102,6 +103,7 @@ const {
   releaseInventoryReservation,
   restoreInventoryForOrder,
 } = require("../lib/inventory/orderInventory");
+const { claimOrderTransition, releaseOrderTransition, TRANSITION_CONFLICT_RESPONSE } = require("../lib/orders/orderTransitionLock");
 const { getBusinessCheckoutBlock } = require("../utils/checkoutGuards");
 const {
   sendOrderStatusEmail,
@@ -122,6 +124,15 @@ const {
 } = require("../utils/vendorTax");
 
 const { evaluateCouponDiscount } = require("../utils/couponDiscount");
+const { priceOrderLines } = require("../lib/orders/orderPricing");
+const {
+  sendOrderAcceptedSMS,
+  sendOrderCancelledCustomerSMS,
+  sendOrderShippedSMS,
+  sendOrderDeliveredSMS,
+  sendOrderRefundedSMS,
+  sendOrderCancelledVendorSMS,
+} = require('../utils/telnyxService');
 
 const toNum = (value) => {
   if (value && typeof value === "object" && value.$numberDecimal != null) {
@@ -132,6 +143,38 @@ const toNum = (value) => {
 };
 
 const getAuthenticatedUserId = (req) => req.user?.id || req.user?._id;
+
+// Claims the atomic transition lock for an order whose status was just checked
+// in memory. Returns null when a concurrent request changed or holds the order.
+async function claimTransition(order, expectedStatus) {
+  const at = new Date();
+  const claimed = await claimOrderTransition(Order, order._id, expectedStatus, at);
+  return claimed ? { orderId: order._id, at } : null;
+}
+
+async function releaseTransition(claim) {
+  if (claim) await releaseOrderTransition(Order, claim.orderId, claim.at);
+}
+
+// Returns stock that was decremented at payment. Never throws: callers run this
+// after a refund has already been issued, and the order must still be saved.
+// On failure inventoryDecrementedAt stays set, which marks the order for
+// manual stock reconciliation.
+async function restoreDecrementedInventory(order, reason) {
+  if (!order.inventoryDecrementedAt) return "not_needed";
+  try {
+    const result = await restoreInventoryForOrder(order);
+    if (!result.restored) return "not_needed";
+    order.inventoryDecrementedAt = undefined;
+    return "restored";
+  } catch (restoreErr) {
+    console.error(
+      `[inventory] restore failed for ${reason} order ${order._id}; needs manual reconciliation:`,
+      restoreErr?.message || restoreErr
+    );
+    return "failed";
+  }
+}
 
 function serializeOrderForResponse(order) {
   if (!order) return order;
@@ -603,6 +646,183 @@ function assertClientTotalsMatch(body, serverTotals) {
 //   }
 // };
 
+const orderPricingDependencies = {
+  resolveShippingForCheckout, getTaxRateForCategory, buildTaxAwareAmounts,
+  extractTaxFromInclusiveAmount, roundCurrency, evaluateCouponDiscount,
+};
+
+exports.buyNowQuote = async (req, res) => {
+  try {
+    const { items, couponCode } = req.body || {};
+    const userId = req.user.id;
+    const deliverySpeed = resolveRequestedDeliverySpeed(req.body);
+    if (!Array.isArray(items) || !items.length) {
+      return res.status(400).json({ success: false, message: "Items are required" });
+    }
+    if (items.length > 50) {
+      return res.status(400).json({ success: false, message: "A maximum of 50 items is allowed" });
+    }
+    const vendorItemMap = {};
+    const seen = new Set();
+
+    for (const item of items) {
+      const { productId, variantId, size, quantity, price } = item || {};
+      // Preserve initiateOrder's truthy quantity check and let shared pricing
+      // perform the same Number coercion (including numeric strings).
+
+      if (
+        !productId || !variantId || !size ||
+        !quantity ||
+        !mongoose.isValidObjectId(productId) || !mongoose.isValidObjectId(variantId)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid item structure",
+        });
+      }
+
+      const key = `${variantId}-${size}`;
+      if (seen.has(key)) {
+        return res.status(400).json({
+          success: false,
+          message: "Duplicate item in cart",
+        });
+      }
+      seen.add(key);
+
+      const variant = await ProductVariant.findById(variantId).populate(
+        "productId"
+      );
+
+      if (
+        !variant ||
+        !variant.productId ||
+        !variant.productId.isPublished ||
+        !variant.productId.isActive ||
+        variant.productId.isDeleted ||
+        !variant.isPublished ||
+        variant.isDeleted ||
+        variant.productId._id.toString() !== productId
+      ) {
+        return res.status(404).json({
+          success: false,
+          message: "Product not found",
+        });
+      }
+
+      const selectedVariant = resolveVariantSelection(variant, size);
+
+      if (!selectedVariant) {
+        return res.status(400).json({
+          success: false,
+          message: `Size ${size} not available`,
+        });
+      }
+
+      if (!selectedVariant.allowBackorder && selectedVariant.stock < quantity) {
+        return res.status(400).json({
+          success: false,
+          message: `${variant.productId.title} is out of stock for size ${size}`,
+        });
+      }
+
+      const discountEnd = selectedVariant.discountEndDate
+        ? new Date(selectedVariant.discountEndDate)
+        : null;
+
+      const validDiscount =
+        selectedVariant.salePrice &&
+        (!discountEnd || discountEnd.getTime() > Date.now());
+
+      const actualPrice = validDiscount
+        ? Number(selectedVariant.salePrice)
+        : Number(selectedVariant.price);
+
+      const vendorId = variant.ownerId.toString();
+
+      if (!vendorItemMap[vendorId]) {
+        vendorItemMap[vendorId] = {
+          businessId: variant.businessId,
+          items: [],
+        };
+      }
+
+      vendorItemMap[vendorId].items.push({
+        productId,
+        variantId,
+        quantity,
+        submittedPrice: Number(price),
+        priceExclTax: actualPrice,
+        size,
+        sku: selectedVariant.sku,
+        taxCategory: getResolvedTaxCategory(variant.productId),
+        color:
+          variant.color ||
+          getVariantAttribute(variant, "color") ||
+          "default",
+        shippingMethod: deliverySpeed,
+        shipping:
+          variant.shipping ||
+          variant.productId?.shipping ||
+          null,
+      });
+    }
+
+    const vendorIds = Object.keys(vendorItemMap);
+
+    if (vendorIds.length !== 1) {
+      return res.status(400).json({
+        success: false,
+        message: "Single-vendor checkout only at this time.",
+      });
+    }
+
+    const vendorId = vendorIds[0];
+    const { businessId, items: rawVendorItems } = vendorItemMap[vendorId];
+
+    const business = await Business.findById(businessId);
+
+    // Vendor accounts may buy from other vendors, never from themselves:
+    // a self-purchase would route a Connect charge back to the buyer and
+    // could fabricate sales or reviews.
+    const buyerId = String(userId);
+    if (
+      vendorId === buyerId ||
+      (business?.owner && String(business.owner) === buyerId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: "SELF_PURCHASE_FORBIDDEN",
+        message: "You can't purchase products from your own business.",
+      });
+    }
+
+    const checkoutBlock = getBusinessCheckoutBlock(business);
+    if (checkoutBlock) {
+      return res.status(checkoutBlock.status).json({
+        success: false,
+        message: checkoutBlock.message,
+      });
+    }
+
+    // initiateOrder refreshes these fields from Stripe before checking them.
+    // Quotes must not call Stripe; stale stored fields can therefore diverge
+    // from checkout until the next account refresh. Payouts are not a blocker.
+    if (!business.chargesEnabled || getTransferCapabilityStatus(business) !== "active") {
+      return res.status(400).json({ success: false, message: "Vendor Stripe onboarding incomplete." });
+    }
+
+    const p = await priceOrderLines({ rawVendorItems, business, businessId, deliverySpeed, couponCode, validateSubmittedPrices: false }, orderPricingDependencies);
+    return res.json({ success: true, pricing: { lineItems: p.vendorItems,
+      subtotal: p.subtotalAmount, taxTotal: p.taxTotal, discountAmount: p.discountAmount,
+      discountedSubtotal: p.discountedSubtotal, shippingTotal: Number(p.shippingCalculation.amount || 0),
+      totalAmount: p.totalAmount, currency: "USD" } });
+  } catch (err) {
+    if (err.statusCode !== 400) console.error(err.message);
+    return res.status(err.statusCode === 400 ? 400 : 500).json({ success: false,
+      message: err.statusCode === 400 ? err.message : "Server error" });
+  }
+};
 
 exports.initiateOrder = async (req, res) => {
   try {
@@ -739,6 +959,21 @@ exports.initiateOrder = async (req, res) => {
     const business = await Business.findById(businessId);
     const user = await User.findById(userId).select("email");
 
+    // Vendor accounts may buy from other vendors, never from themselves:
+    // a self-purchase would route a Connect charge back to the buyer and
+    // could fabricate sales or reviews.
+    const buyerId = String(userId);
+    if (
+      vendorId === buyerId ||
+      (business?.owner && String(business.owner) === buyerId)
+    ) {
+      return res.status(403).json({
+        success: false,
+        code: "SELF_PURCHASE_FORBIDDEN",
+        message: "You can't purchase products from your own business.",
+      });
+    }
+
     const checkoutBlock = getBusinessCheckoutBlock(business);
     if (checkoutBlock) {
       return res.status(checkoutBlock.status).json({
@@ -782,115 +1017,9 @@ exports.initiateOrder = async (req, res) => {
       });
     }
 
-    const vendorItems = rawVendorItems.map((item) => {
-      const taxRate = getTaxRateForCategory(
-        business.taxSettings,
-        item.taxCategory
-      );
-      const taxPricing = buildTaxAwareAmounts({
-        priceExclTax: item.priceExclTax,
-        salePriceExclTax: null,
-        taxRate,
-      });
-      const unitPriceInclTax = taxPricing.priceInclTax ?? roundCurrency(item.priceExclTax);
-      const lineAmounts = extractTaxFromInclusiveAmount({
-        inclusiveAmount: unitPriceInclTax * Number(item.quantity || 0),
-        taxRate,
-      });
-      const submittedPrice = Number(item.submittedPrice);
-      const acceptsLegacyPrice =
-        Math.abs(submittedPrice - Number(item.priceExclTax || 0)) < 0.01;
-      const acceptsTaxInclusivePrice =
-        Math.abs(submittedPrice - Number(unitPriceInclTax || 0)) < 0.01;
-
-      if (!acceptsLegacyPrice && !acceptsTaxInclusivePrice) {
-        const error = new Error(`Price mismatch for size ${item.size}`);
-        error.statusCode = 400;
-        throw error;
-      }
-
-      return {
-        productId: item.productId,
-        variantId: item.variantId,
-        quantity: item.quantity,
-        price: unitPriceInclTax,
-        size: item.size,
-        sku: item.sku,
-        color: item.color,
-        tax: {
-          categoryCode: item.taxCategory?.code || null,
-          categoryLabel: item.taxCategory?.label || null,
-          rate: taxRate,
-          taxIncluded: true,
-          unitPriceExclTax: taxPricing.priceExclTax,
-          unitPriceInclTax,
-          lineBaseAmount: lineAmounts.amountExclTax,
-          lineTaxAmount: lineAmounts.taxAmount,
-          lineTotalAmount: lineAmounts.amountInclTax,
-        },
-      };
-    });
-
-    const subtotalAmount = vendorItems.reduce(
-      (sum, i) => sum + Number(i.tax?.lineTotalAmount || (i.price * i.quantity) || 0),
-      0
-    );
-    const subtotalExclTaxAmount = vendorItems.reduce(
-      (sum, i) => sum + Number(i.tax?.lineBaseAmount || 0),
-      0
-    );
-    const taxTotal = vendorItems.reduce(
-      (sum, i) => sum + Number(i.tax?.lineTaxAmount || 0),
-      0
-    );
-    const totalQuantity = vendorItems.reduce(
-      (sum, i) => sum + Number(i.quantity || 0),
-      0
-    );
-
-    let discountAmount = 0;
-    let discountedSubtotal = subtotalAmount;
-    let appliedCouponCode = null;
-
-    if (couponCode) {
-      const couponResult = await evaluateCouponDiscount({
-        couponCode,
-        businessId,
-        subtotalAmount,
-      });
-
-      if (!couponResult.ok) {
-        return res.status(400).json({
-          success: false,
-          message: couponResult.message,
-        });
-      }
-
-      discountAmount = couponResult.discountAmount;
-      discountedSubtotal = couponResult.discountedSubtotal;
-      appliedCouponCode = couponResult.couponCode;
-    }
-
-    let shippingCalculation;
-    try {
-      shippingCalculation = resolveShippingForCheckout(
-        business.shippingSettings,
-        {
-          deliverySpeed,
-          subtotal: discountedSubtotal,
-          totalQuantity,
-          legacyItems: rawVendorItems,
-        }
-      );
-    } catch (shippingError) {
-      return res.status(400).json({
-        success: false,
-        message: shippingError.message,
-      });
-    }
-
-    const totalAmount =
-      discountedSubtotal + Number(shippingCalculation.amount || 0);
+    const { vendorItems, subtotalAmount, subtotalExclTaxAmount, taxTotal,
+      discountAmount, discountedSubtotal, appliedCouponCode, shippingCalculation,
+      totalAmount } = await priceOrderLines({ rawVendorItems, business, businessId, deliverySpeed, couponCode }, orderPricingDependencies);
 
     const tamperCheck = assertClientTotalsMatch(req.body, {
       totalAmount,
@@ -1054,15 +1183,6 @@ exports.initiateOrder = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Order initiation failed:", err);
-    console.error("Order initiation Stripe details:", {
-      type: err?.type,
-      code: err?.code,
-      message: err?.message,
-      statusCode: err?.statusCode,
-      requestId: err?.requestId,
-    });
-
     if (err?.statusCode === 400) {
       return res.status(400).json({
         success: false,
@@ -1076,6 +1196,15 @@ exports.initiateOrder = async (req, res) => {
         message: "Vendor Stripe onboarding incomplete.",
       });
     }
+
+    console.error("Order initiation failed:", err);
+    console.error("Order initiation Stripe details:", {
+      type: err?.type,
+      code: err?.code,
+      message: err?.message,
+      statusCode: err?.statusCode,
+      requestId: err?.requestId,
+    });
 
     return res.status(500).json({
       success: false,
@@ -1171,8 +1300,18 @@ exports.acceptOrder = async (req, res) => {
     const emailDelivery = await sendCustomerOrderLifecycleEmail({
       order,
       event: "order_accepted",
-      send: (customerEmail) => sendOrderStatusEmail(customerEmail, order._id.toString(), "accepted"),
+      send: (customerEmail) => sendOrderStatusEmail(customerEmail, order, "accepted"),
     });
+
+    // 3C — Send order accepted SMS to customer (non-blocking)
+    const acceptedCustomerPhone = order?.userId?.mobile;
+    if (acceptedCustomerPhone) {
+      sendOrderAcceptedSMS({
+        to: acceptedCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+        vendorName: order.businessId?.businessName || undefined,
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
@@ -1187,6 +1326,7 @@ exports.acceptOrder = async (req, res) => {
 };
 
 exports.rejectOrder = async (req, res) => {
+  let transitionClaim = null;
   try {
     const vendorId = req.user._id;
     const orderId = req.params.orderId;
@@ -1205,18 +1345,21 @@ exports.rejectOrder = async (req, res) => {
       });
     }
 
-    order.status = "rejected";
-    order.statusHistory.push({ status: "rejected" });
+    transitionClaim = await claimTransition(order, "ordered");
+    if (!transitionClaim) {
+      return res.status(409).json(TRANSITION_CONFLICT_RESPONSE);
+    }
 
-    // Refund if already paid
-    if (order.paymentStatus === "paid" && order.paymentId) {
-      const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-
-      const vendorStripeAccountId = order.businessId.stripeConnectAccountId; // Vendor's Stripe Connect Account ID
-
+    const claimFilter = { _id: order._id, status: "ordered", transitionLockedAt: transitionClaim.at };
+    if (!order.rejectionRefundId && !order.rejectionRefundedAt && order.paymentStatus === "paid" && order.paymentId) {
+      const previouslyRequested = Boolean(order.rejectionRefundRequestedAt);
+      const pending = await Order.updateOne(claimFilter, {
+        $set: { rejectionRefundRequestedAt: order.rejectionRefundRequestedAt || new Date() },
+      });
+      if (pending.matchedCount === 0) return res.status(409).json(TRANSITION_CONFLICT_RESPONSE);
+      let refund;
       try {
-        // Create the refund from the vendor's Stripe account
-        const refund = await stripe.refunds.create({
+        refund = await stripe.refunds.create({
           payment_intent: order.paymentId,               // pi_...
           amount: Math.round(order.totalAmount * 100),   // in the smallest currency unit
           reason: "requested_by_customer",
@@ -1226,39 +1369,81 @@ exports.rejectOrder = async (req, res) => {
           // ensure funds are pulled back from the connected account & app fee is refunded
           reverse_transfer: true,
           refund_application_fee: true,
-        });
-
-
-        // Update order and payment status
-        order.paymentStatus = "refunded";
-        order.statusHistory.push({ status: "refunded" });
-
-        console.log("Refund initiated for order", {
-          orderId,
-          paymentIntentId: order.paymentId,
+        }, {
+          // One refund per order for this flow, even on double-submit/retry.
+          idempotencyKey: `refund:${order._id}:rejected_by_merchant`,
         });
       } catch (err) {
-        console.error("Error processing refund via Stripe Connect:", err);
-        return res.status(500).json({ success: false, message: "Refund failed" });
+        if (err.code === "charge_already_refunded" && previouslyRequested) {
+          refund = { id: null };
+          console.error("Previously requested rejection refund needs reconciliation", { orderId, paymentIntentId: order.paymentId });
+        } else {
+          console.error("Error processing refund via Stripe Connect:", err);
+          return res.status(500).json({ success: false, message: "Refund failed" });
+        }
       }
+      const refundedAt = new Date();
+      try {
+        const evidence = await Order.updateOne(claimFilter, {
+          $set: { paymentStatus: "refunded", rejectionRefundId: refund.id, rejectionRefundedAt: refundedAt },
+        });
+        if (evidence.matchedCount === 0) return res.status(409).json(TRANSITION_CONFLICT_RESPONSE);
+      } catch (err) {
+        console.error("Rejection refund evidence write failed", { orderId, refundId: refund.id, error: err.message });
+        return res.status(500).json({ success: false, code: "ORDER_REJECT_RECONCILE", message: "Order rejection needs reconciliation. Please retry." });
+      }
+      order.rejectionRefundId = refund.id;
+      order.rejectionRefundedAt = refundedAt;
+      order.paymentStatus = "refunded";
     }
-
-    await order.save();
+    const history = [{ status: "rejected" }];
+    if ((order.rejectionRefundId || order.rejectionRefundedAt) && !order.statusHistory.some(entry => entry.status === "refunded")) {
+      history.push({ status: "refunded" });
+    }
+    const inventoryRestore = await restoreDecrementedInventory(order, "rejected");
+    const update = {
+      $set: { status: "rejected", paymentStatus: order.paymentStatus },
+      $push: { statusHistory: { $each: history } },
+    };
+    if (inventoryRestore === "restored") {
+      update.$unset = { inventoryDecrementedAt: 1 };
+      update.$set.inventoryRestoredAt = order.inventoryRestoredAt;
+    }
+    const transitioned = await Order.updateOne(claimFilter, update);
+    if (transitioned.matchedCount === 0) return res.status(409).json(TRANSITION_CONFLICT_RESPONSE);
+    order.status = "rejected";
+    order.statusHistory.push(...history);
+    // These paths were persisted atomically; notification bookkeeping may save this document.
+    for (const path of ["status", "paymentStatus", "statusHistory", "rejectionRefundId", "rejectionRefundedAt", "inventoryDecrementedAt", "inventoryRestoredAt"]) {
+      order.unmarkModified(path);
+    }
     const emailDelivery = await sendCustomerOrderLifecycleEmail({
       order,
       event: "order_rejected",
-      send: (customerEmail) => sendOrderStatusEmail(customerEmail, order._id.toString(), "rejected"),
+      send: (customerEmail) => sendOrderStatusEmail(customerEmail, order, "rejected"),
     });
+
+    // 3F — Send order cancelled SMS to customer (non-blocking)
+    const rejectedCustomerPhone = order?.userId?.mobile;
+    if (rejectedCustomerPhone) {
+      sendOrderCancelledCustomerSMS({
+        to: rejectedCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
       message: "Order rejected and refunded (if paid)",
       emailDelivery,
+      inventoryRestore,
       order: serializeOrderForResponse(order),
     });
   } catch (err) {
     console.error("Error rejecting order:", err);
     res.status(500).json({ success: false, message: "Server error" });
+  } finally {
+    await releaseTransition(transitionClaim);
   }
 };
 
@@ -1266,17 +1451,26 @@ exports.shipOrder = async (req, res) => {
   try {
     const vendorId = req.user._id;
     const orderId = req.params.orderId;
-    const { trackingId, trackingUrl, vendorNote } = req.body;
+    const { trackingId, trackingUrl: rawTrackingUrl, vendorNote } = req.body;
 
-    if (!trackingId || !trackingUrl) {
+    if (!trackingId || !rawTrackingUrl) {
       return res.status(400).json({
         success: false,
         message: "Tracking ID and URL are required",
       });
     }
+    // Stored, shown to the customer and sent by email/SMS: http(s) only.
+    const trackingUrl = normalizeUserHttpUrl(rawTrackingUrl);
+    if (!trackingUrl) {
+      return res.status(400).json({
+        success: false,
+        code: "TRACKING_URL_INVALID",
+        message: "Tracking URL must be a valid http(s) URL",
+      });
+    }
 
     const order = await Order.findOne({ _id: orderId, vendorId })
-      .populate("userId", "email"); // ✅ FIX
+      .populate("userId", "name email");
 
     if (!order) {
       return res.status(404).json({
@@ -1309,6 +1503,17 @@ exports.shipOrder = async (req, res) => {
         sendOrderUpdateEmail(customerEmail, "shipped", trackingUrl, { trackingId }),
     });
 
+    // 3D — Send order shipped SMS to customer (non-blocking)
+    const shippedCustomerPhone = order?.userId?.mobile;
+    if (shippedCustomerPhone) {
+      sendOrderShippedSMS({
+        to: shippedCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+        trackingId: trackingId || undefined,
+        trackingUrl: trackingUrl || undefined,
+      }).catch(() => {});
+    }
+
     res.json({
       success: true,
       message: "Order marked as shipped",
@@ -1327,7 +1532,7 @@ exports.deliverOrder = async (req, res) => {
     const orderId = req.params.orderId;
 
     const order = await Order.findOne({ _id: orderId, vendorId })
-      .populate("userId", "email"); // ✅ IMPORTANT FIX
+      .populate("userId", "name email"); // ✅ IMPORTANT FIX
 
     if (!order) {
       return res.status(404).json({
@@ -1352,8 +1557,18 @@ exports.deliverOrder = async (req, res) => {
     const emailDelivery = await sendCustomerOrderLifecycleEmail({
       order,
       event: "order_delivered",
-      send: (customerEmail) => sendOrderUpdateEmail(customerEmail, "delivered"),
+      send: (customerEmail) => sendOrderUpdateEmail(customerEmail, "delivered", null, { order }),
     });
+
+    // 3E — Send order delivered SMS to customer (non-blocking)
+    const deliveredCustomerPhone = order?.userId?.mobile;
+    if (deliveredCustomerPhone) {
+      sendOrderDeliveredSMS({
+        to: deliveredCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+        vendorName: order.businessId?.businessName || undefined,
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
@@ -1396,6 +1611,15 @@ exports.initiateReturn = async (req, res) => {
       event: "return_initiated",
       send: (customerEmail) => sendOrderLifecycleEmail(customerEmail, order, "return_initiated"),
     });
+
+    // 3G — Send return/refund SMS to customer (non-blocking)
+    const returnCustomerPhone = order?.userId?.mobile;
+    if (returnCustomerPhone) {
+      sendOrderRefundedSMS({
+        to: returnCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
@@ -1470,6 +1694,15 @@ exports.acceptReturn = async (req, res) => {
       event: "order_refunded",
       send: (customerEmail) => sendOrderLifecycleEmail(customerEmail, order, "order_refunded"),
     });
+
+    // 3G — Send refunded SMS to customer (non-blocking)
+    const refundedCustomerPhone = order?.userId?.mobile;
+    if (refundedCustomerPhone) {
+      sendOrderRefundedSMS({
+        to: refundedCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+      }).catch(() => {});
+    }
 
     res.json({
       success: true,
@@ -1815,6 +2048,15 @@ exports.cancelOrderByUser = async (req, res) => {
       event: "order_cancelled",
       send: (customerEmail) => sendOrderLifecycleEmail(customerEmail, order, "order_cancelled"),
     });
+
+    // 3F — Send cancelled SMS to customer + vendor (non-blocking)
+    const cancelledCustomerPhone = order?.userId?.mobile;
+    if (cancelledCustomerPhone) {
+      sendOrderCancelledCustomerSMS({
+        to: cancelledCustomerPhone,
+        orderNumber: order.orderNumber || order._id.toString().slice(-8),
+      }).catch(() => {});
+    }
 
     return res.json({
       success: true,

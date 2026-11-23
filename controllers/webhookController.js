@@ -9,6 +9,10 @@ const {
   publicPaidOrderEmailDelivery,
   sendOrderPaidConfirmationIfNeeded,
 } = require('../utils/sendOrderPaidConfirmation');
+const { sendVendorTierWelcomeSMS } = require('../utils/telnyxService');
+const { triggerTierWelcomeNotifications } = require('../utils/vendorTierWelcomeEmail');
+const User = require('../models/User');
+const SubscriptionPlan = require('../models/SubscriptionPlan');
 
 const toPublicEmailDelivery = (result) =>
   typeof publicPaidOrderEmailDelivery === 'function'
@@ -386,6 +390,9 @@ const handleSubscriptionWebhook = async (req, res) => {
       subscription.status = 'active';
       await subscription.save();
       console.log(`✅ Subscription payment succeeded: ${subscription._id}`);
+
+      // Send tier welcome email + SMS notifications idempotently (non-blocking)
+      triggerTierWelcomeNotifications(subscription);
       break;
 
     case 'invoice.payment_failed':
@@ -420,6 +427,7 @@ const handleSubscriptionWebhook = async (req, res) => {
             subscription.status = 'active';
             await subscription.save();
             console.log(`✅ Subscription charge updated - payment succeeded: ${subscription._id}`);
+            triggerTierWelcomeNotifications(subscription);
           } else {
             console.error('❌ Subscription not found for:', charge.metadata.subscriptionId);
           }
@@ -443,6 +451,7 @@ const handleSubscriptionWebhook = async (req, res) => {
             subscription.status = 'active';
             await subscription.save();
             console.log(`✅ Subscription charge succeeded: ${subscription._id}`);
+            triggerTierWelcomeNotifications(subscription);
           }
         } catch (error) {
           console.error('Error handling charge.succeeded:', error);
@@ -464,6 +473,7 @@ const handleSubscriptionWebhook = async (req, res) => {
             subscription.status = 'active';
             await subscription.save();
             console.log(`✅ Subscription payment intent succeeded: ${subscription._id}`);
+            triggerTierWelcomeNotifications(subscription);
           }
         } catch (error) {
           console.error('Error handling payment_intent.succeeded:', error);

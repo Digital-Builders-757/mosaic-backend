@@ -1,0 +1,331 @@
+name: Deploy to Elastic Beanstalk - Staging
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - staging
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  # Staging deploys only to its own Elastic Beanstalk application, which shares
+  # no application versions or bundles with production. Hard-coded on purpose:
+  # a repository variable must not be able to point this workflow at the
+  # production application.
+  EB_APPLICATION_NAME: mosaic-staging-backend
+  EB_ENVIRONMENT_NAME: mosaic-staging-api
+  STAGING_API_URL: https://api-staging.mosaicbizhub.com
+  STAGING_API_HOST: api-staging.mosaicbizhub.com
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    name: Deploy Staging
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 45
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write runtime release manifest
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -e release-manifest.json ]; then
+            echo "The reserved runtime release-manifest.json path must not be committed" >&2
+            exit 1
+          fi
+          SOURCE_TREE=$(git rev-parse "${RELEASE_SHA}^{tree}")
+          node - "$RELEASE_SHA" "$SOURCE_TREE" "mosaic-staging-${RELEASE_SHA}" > release-manifest.json <<'NODE'
+          const [commit, sourceTree, deploymentVersion] = process.argv.slice(2);
+          process.stdout.write(JSON.stringify({
+            schemaVersion: 1,
+            commit,
+            sourceTree,
+            environment: 'staging',
+            deploymentVersion,
+          }));
+          NODE
+          cat release-manifest.json
+
+      - name: Create deployment package
+        run: |
+          shopt -s dotglob
+
+          zip -r deploy.zip . \
+            -x "*.git*" \
+            -x "*node_modules/*" \
+            -x "*.env*" \
+            -x "*tests/*" \
+            -x "*docs/*" \
+            -x "*.github/*" \
+            -x "*.zip" \
+            -x "*logs/*" \
+            -x "*.log" \
+            -x "debug-data.js" \
+            -x "fix-product-data.js" \
+            -x "fix-variants.js" \
+            -x "test-products.js" \
+            -x "*.txt"
+
+      - name: Configure AWS credentials
+        id: aws_creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          output-credentials: true
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Record deploy start time
+        id: deploy_start
+        shell: bash
+        run: |
+          set -euo pipefail
+          started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deploy start (UTC): ${started_at}"
+          echo "started_at=${started_at}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Elastic Beanstalk
+        uses: einaregilsson/beanstalk-deploy@v22
+        with:
+          aws_access_key: ${{ steps.aws_creds.outputs.aws-access-key-id }}
+          aws_secret_key: ${{ steps.aws_creds.outputs.aws-secret-access-key }}
+          aws_session_token: ${{ steps.aws_creds.outputs.aws-session-token }}
+          application_name: ${{ env.EB_APPLICATION_NAME }}
+          environment_name: ${{ env.EB_ENVIRONMENT_NAME }}
+          region: ${{ env.AWS_REGION }}
+          version_label: mosaic-staging-${{ github.sha }}
+          deployment_package: deploy.zip
+          use_existing_version_if_available: true
+          wait_for_deployment: true
+          # Seconds (not a boolean) to wait for the environment to return to
+          # Green/Ok after the deploy. A non-numeric value is not a documented
+          # setting for this input, so state the recovery window explicitly.
+          wait_for_environment_recovery: 60
+
+      # A same-version redeploy (use_existing_version_if_available) can report
+      # success even if Elastic Beanstalk rejects the update, because the
+      # release identity probe only sees the version that was already live.
+      # Assert the Elastic Beanstalk side of the deploy explicitly.
+      - name: Verify Elastic Beanstalk deploy outcome
+        shell: bash
+        env:
+          DEPLOY_STARTED_AT: ${{ steps.deploy_start.outputs.started_at }}
+          EXPECTED_VERSION_LABEL: mosaic-staging-${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Events can surface shortly after the deploy action returns, so poll
+          # several times and fail on any ERROR-or-higher event in any poll.
+          for attempt in 1 2 3; do
+            aws elasticbeanstalk describe-events \
+              --environment-name "$EB_ENVIRONMENT_NAME" \
+              --start-time "$DEPLOY_STARTED_AT" \
+              --severity ERROR \
+              --output json \
+              | node -e '
+                const attempt = process.argv[1];
+                const events = JSON.parse(require("fs").readFileSync(0, "utf8")).Events || [];
+                if (events.length === 0) {
+                  console.log(`Poll ${attempt}: no ERROR-or-higher Elastic Beanstalk events since deploy start`);
+                  process.exit(0);
+                }
+                console.error(`Poll ${attempt}: Elastic Beanstalk reported ${events.length} ERROR-or-higher event(s) since deploy start:`);
+                for (const event of events) {
+                  const message = String(event.Message || "").slice(0, 200);
+                  console.error(`- ${event.EventDate} ${event.Severity}: ${message}`);
+                }
+                process.exit(1);
+              ' "$attempt"
+            if [ "$attempt" -lt 3 ]; then
+              sleep 15
+            fi
+          done
+
+          aws elasticbeanstalk describe-environments \
+            --environment-names "$EB_ENVIRONMENT_NAME" \
+            --no-include-deleted \
+            --output json \
+            | node -e '
+              const envs = JSON.parse(require("fs").readFileSync(0, "utf8")).Environments || [];
+              const expectedVersion = process.argv[1];
+              if (envs.length !== 1) {
+                console.error(`Expected exactly one environment, found ${envs.length}`);
+                process.exit(1);
+              }
+              const { VersionLabel, Status, Health } = envs[0];
+              console.log(`VersionLabel=${VersionLabel} Status=${Status} Health=${Health}`);
+              const problems = [];
+              if (VersionLabel !== expectedVersion) problems.push(`VersionLabel is not ${expectedVersion}`);
+              if (Status !== "Ready") problems.push("Status is not Ready");
+              if (Health === "Red" || Health === "Grey") problems.push(`Health is ${Health}`);
+              if (problems.length > 0) {
+                console.error(`Elastic Beanstalk environment check failed: ${problems.join("; ")}`);
+                process.exit(1);
+              }
+            ' "$EXPECTED_VERSION_LABEL"
+
+      - name: Route probes to the deployed environment
+        # Probes must reach the environment that was just deployed, not whatever
+        # the public DNS name currently points at (before the DNS cutover it still
+        # points at the previous environment). curl --connect-to keeps the
+        # api-staging hostname for SNI/Host and certificate validation while
+        # connecting to this environment's own load balancer.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cname=$(aws elasticbeanstalk describe-environments             --environment-names "$EB_ENVIRONMENT_NAME"             --query 'Environments[?Status!=`Terminated`] | [0].CNAME' --output text)
+          if ! [[ "$cname" =~ ^[a-z0-9.-]+\.elasticbeanstalk\.com$ ]]; then
+            echo "Could not resolve the CNAME of $EB_ENVIRONMENT_NAME (got: $cname)" >&2
+            exit 1
+          fi
+          echo "Probing ${STAGING_API_HOST} via ${cname}"
+          echo "CURL_ROUTE=--connect-to ${STAGING_API_HOST}:443:${cname}:443" >> "$GITHUB_ENV"
+
+      - name: Post-deploy health probe
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          echo "Version label: mosaic-staging-${{ github.sha }}"
+          echo "Staging API: ${STAGING_API_URL}"
+
+          for i in 1 2 3 4 5; do
+            status=$(curl -s $CURL_ROUTE -o /tmp/health.json -w "%{http_code}" "${STAGING_API_URL}/")
+
+            echo "Attempt $i: HTTP $status"
+
+            if [ "$status" = "200" ]; then
+              cat /tmp/health.json
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "Health probe failed after 5 attempts"
+          exit 1
+
+      - name: Post-deploy release identity probe
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4 5; do
+            if body=$(curl -sS $CURL_ROUTE --fail --max-time 10 "${STAGING_API_URL}/api/health"); then
+              echo "Attempt $i: $body"
+              if node -e '
+                const info = JSON.parse(process.argv[1]).release || {};
+                const sha = process.argv[2];
+                const ok = info.environment === "staging"
+                  && info.commit === sha.slice(0, 7)
+                  && info.deploymentVersion === `mosaic-staging-${sha}`;
+                process.exit(ok ? 0 : 1);
+              ' "$body" "$RELEASE_SHA"; then
+                exit 0
+              fi
+            else
+              echo "Attempt $i: health request failed"
+            fi
+            sleep 15
+          done
+          echo "Staging /api/health did not report release ${RELEASE_SHA} in environment staging" >&2
+          exit 1
+
+      - name: Post-deploy isolation probe
+        # Once the deployed code ships the isolation self-check (utils/isolationSelfCheck.js),
+        # staging must prove isolation before the deploy counts as good: staging marker on,
+        # staging-only database, Stripe test mode, and mail/SMS recipient guards not "off".
+        shell: bash
+        run: |
+          set -uo pipefail
+          if [ ! -f utils/isolationSelfCheck.js ]; then
+            echo "::notice::Deployed code predates the isolation self-check; skipping isolation probe."
+            exit 0
+          fi
+          for i in 1 2 3 4 5; do
+            if body=$(curl -sS $CURL_ROUTE --fail --max-time 10 "${STAGING_API_URL}/api/ready"); then
+              if node -e '
+                const iso = (JSON.parse(process.argv[1]) || {}).isolation || {};
+                const problems = [];
+                if (iso.stagingMarker !== true) problems.push("stagingMarker is not true");
+                if ((iso.database || {}).name !== "mosaic_staging") problems.push("database is not mosaic_staging");
+                if ((iso.stripe || {}).mode !== "test") problems.push("stripe mode is not test");
+                for (const ch of ["mail", "sms"]) {
+                  const policy = (iso[ch] || {}).recipientPolicy;
+                  if (!policy || policy === "off") problems.push(ch + " recipient guard is off");
+                }
+                if (problems.length) { console.error(problems.join("; ")); process.exit(1); }
+                console.log("Isolation verified");
+              ' "$body"; then
+                exit 0
+              fi
+            else
+              echo "Attempt $i: ready request failed"
+            fi
+            sleep 15
+          done
+          echo "Staging isolation could not be verified" >&2
+          exit 1
+
+      - name: Post-deploy auth probe
+        run: |
+          status=$(curl -s $CURL_ROUTE -o /dev/null -w "%{http_code}" \
+            "${STAGING_API_URL}/api/users/auth/check")
+
+          echo "Auth check (unauthenticated): HTTP $status"
+
+          if [ "$status" != "401" ]; then
+            echo "Expected 401 for unauthenticated auth/check"
+            exit 1
+          fi
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## Staging deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Version label | \`mosaic-staging-${{ github.sha }}\` |"
+            echo "| EB application | \`${{ env.EB_APPLICATION_NAME }}\` |"
+            echo "| EB environment | \`${{ env.EB_ENVIRONMENT_NAME }}\` |"
+            echo "| Region | \`${{ env.AWS_REGION }}\` |"
+            echo "| API URL | \`${{ env.STAGING_API_URL }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

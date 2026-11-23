@@ -7,12 +7,21 @@ const {
   sendVendorNewServiceBookingEmail,
   sendVendorNewFoodBookingEmail,
   sendCustomerNewServiceBookingConfirmationEmail,
+  sendCustomerNewFoodBookingConfirmationEmail,
   sendCustomerServicePaymentRequestEmail,
   sendCustomerServiceBookingDecisionEmail,
 } = require('../utils/bookingMailer');
+const { normalizeUserHttpUrl } = require('../utils/emailTemplates/baseLayout');
 const {
   resolveVendorBookingNotificationRecipients,
 } = require('../utils/notificationPreferenceGate');
+const {
+  sendServiceBookingCreatedCustomerSMS,
+  sendServiceBookingAlertVendorSMS,
+  sendServiceBookingApprovedSMS,
+  sendServiceBookingRejectedSMS,
+  sendFoodReservationCreatedSMS,
+} = require('../utils/telnyxService');
 
 const ALLOWED_SEAT_OPTIONS = ['upto 2', 'upto 4', 'upto 8', 'more than 10'];
 
@@ -34,6 +43,24 @@ const normalizeStringArray = (value) => {
 };
 
 const getAuthenticatedUserId = (req) => req.user?.id || req.user?._id;
+
+// Vendor accounts may book other businesses, never their own listings.
+const rejectSelfBooking = (req, res, listingOwnerId) => {
+  const userId = getAuthenticatedUserId(req);
+  if (!listingOwnerId) {
+    res.status(409).json({ success: false, message: 'This listing is not available for booking.' });
+    return true;
+  }
+  if (userId && String(listingOwnerId) === String(userId)) {
+    res.status(403).json({
+      success: false,
+      code: 'SELF_BOOKING_FORBIDDEN',
+      message: "You can't book your own business's listing.",
+    });
+    return true;
+  }
+  return false;
+};
 
 const formatBookingDate = (value) => {
   if (!value) return 'N/A';
@@ -101,6 +128,8 @@ exports.createServiceBooking = async (req, res) => {
     if (!service) {
       return res.status(404).json({ success: false, message: 'Service not found' });
     }
+
+    if (rejectSelfBooking(req, res, service.ownerId)) return;
 
     const [business, owner] = await Promise.all([
       Business.findById(service.businessId).select('businessName email slug'),
@@ -175,6 +204,17 @@ exports.createServiceBooking = async (req, res) => {
       );
     }
 
+    // 4A — Send customer service booking confirmed SMS (non-blocking)
+    if (phone) {
+      sendServiceBookingCreatedCustomerSMS({
+        to: phone,
+        businessName: business?.businessName || owner?.name || 'the vendor',
+        date: formatBookingDate(date),
+        time: slot,
+        bookingId: newBooking._id.toString().slice(-8),
+      }).catch(() => {});
+    }
+
     res.status(201).json({ success: true, booking: newBooking });
   } catch (error) {
     console.error('Failed to create service booking:', error);
@@ -218,6 +258,8 @@ exports.createFoodBooking = async (req, res) => {
     if (!food) {
       return res.status(404).json({ success: false, message: 'Food listing not found' });
     }
+
+    if (rejectSelfBooking(req, res, food.ownerId)) return;
 
     const [business, owner] = await Promise.all([
       Business.findById(food.businessId).select('businessName email slug'),
@@ -267,6 +309,44 @@ exports.createFoodBooking = async (req, res) => {
       console.error('Failed to send new food booking email to vendor:', mailError?.message || mailError);
     }
 
+    try {
+      const customerEmail = String(email || '').trim();
+      if (!customerEmail) {
+        console.warn('Skipping customer food booking confirmation: missing email', {
+          bookingId: newBooking._id.toString(),
+        });
+      } else {
+        await sendCustomerNewFoodBookingConfirmationEmail({
+          to: customerEmail,
+          customerName: name,
+          restaurantName: business?.businessName || owner?.name || food.title || 'Restaurant',
+          vendorName: owner?.name || business?.businessName || 'Vendor',
+          foodTitle: food.title,
+          date: formatBookingDate(date),
+          slot,
+          seats: normalizedSeats,
+          bookingId: newBooking._id.toString(),
+        });
+      }
+    } catch (mailError) {
+      console.error(
+        'Failed to send food booking confirmation email to customer:',
+        mailError?.message || mailError
+      );
+    }
+
+    // 4E — Send customer food reservation SMS (non-blocking)
+    if (phone) {
+      sendFoodReservationCreatedSMS({
+        to: phone,
+        restaurantName: business?.businessName || food.title,
+        numberOfPeople: normalizedSeats,
+        date: formatBookingDate(date),
+        time: slot,
+        bookingId: newBooking._id.toString().slice(-8),
+      }).catch(() => {});
+    }
+
     res.status(201).json({ success: true, booking: newBooking });
   } catch (error) {
     console.error('Failed to create food booking:', error);
@@ -288,8 +368,16 @@ exports.requestServiceBookingPayment = async (req, res) => {
     if (!paymentLink) {
       return res.status(400).json({ success: false, message: 'paymentLink is required' });
     }
+    const normalizedPaymentLink = normalizeUserHttpUrl(paymentLink);
+    if (!normalizedPaymentLink) {
+      return res.status(400).json({
+        success: false,
+        code: 'PAYMENT_LINK_INVALID',
+        message: 'paymentLink must be a valid http(s) URL',
+      });
+    }
 
-    booking.paymentLink = paymentLink;
+    booking.paymentLink = normalizedPaymentLink;
     booking.paymentRequestedAt = new Date();
     booking.vendorDecisionNote = note || '';
     booking.status = 'payment_requested';
@@ -305,7 +393,7 @@ exports.requestServiceBookingPayment = async (req, res) => {
         vendorName: vendor?.name || 'Vendor',
         date: formatBookingDate(booking.date),
         slot: booking.slot || booking.time,
-        paymentLink,
+        paymentLink: normalizedPaymentLink,
         bookingId: booking._id.toString(),
         message: note,
       });
@@ -359,6 +447,17 @@ exports.approveServiceBooking = async (req, res) => {
       console.error('Failed to send approval email to customer:', mailError);
     }
 
+    // 4C — Send booking approved SMS to customer (non-blocking)
+    if (booking.customerInfo?.phone) {
+      sendServiceBookingApprovedSMS({
+        to: booking.customerInfo.phone,
+        businessName: undefined, // vendor name resolved from email send above
+        serviceName: booking.serviceTitle,
+        date: formatBookingDate(booking.date),
+        time: booking.slot || booking.time,
+      }).catch(() => {});
+    }
+
     res.json({
       success: true,
       message: 'Service booking approved successfully',
@@ -403,6 +502,15 @@ exports.rejectServiceBooking = async (req, res) => {
       });
     } catch (mailError) {
       console.error('Failed to send rejection email to customer:', mailError);
+    }
+
+    // 4D — Send booking rejected SMS to customer (non-blocking)
+    if (booking.customerInfo?.phone) {
+      sendServiceBookingRejectedSMS({
+        to: booking.customerInfo.phone,
+        businessName: undefined,
+        date: formatBookingDate(booking.date),
+      }).catch(() => {});
     }
 
     res.json({
