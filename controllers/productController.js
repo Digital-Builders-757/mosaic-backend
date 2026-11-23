@@ -33,6 +33,12 @@ const {
   logUploadFailure,
 } = require('../utils/uploadDiagnostics');
 const { validateProductPublishState } = require('../lib/marketplace/listingPricePolicy');
+const {
+  summarizeVariantPrices,
+  recomputeProductPriceSummary,
+  recomputeProductPriceSummarySafe,
+} = require('../utils/productPriceSummary');
+const priceSummaryModels = { Product, ProductVariant };
 const { Decimal128 } = mongoose.Types;
 const s3Client = new S3Client(buildS3ClientConfig());
 const { toResponseSalePrice } = require('../lib/marketplace/listingPricePolicy');
@@ -583,19 +589,11 @@ for (const [index, variant] of variants.entries()) {
       // -----------------------------
       // Update product price as minimum variant price
       // -----------------------------
-const prices = savedVariants.map(v => {
-  const sale = v.salePrice ? parseFloat(v.salePrice.toString()) : null;
-  const price = parseFloat(v.price.toString());
-
-  return sale !== null ? sale : price;
-});
-
-const minPrice = Math.min(...prices);
-const maxPrice = Math.max(...prices);
+const priceSummary = summarizeVariantPrices(savedVariants);
 
       await Product.findByIdAndUpdate(product._id, {
-        price: Decimal128.fromString(minPrice.toString()),
-        maxPrice: Decimal128.fromString(maxPrice.toString()),
+        price: priceSummary.price,
+        maxPrice: priceSummary.maxPrice,
         isPublished: willPublish,
       });
 
@@ -871,6 +869,9 @@ exports.getProductById = async (req, res) => {
  * UPDATE PRODUCT
  */
 exports.updateProduct = async (req, res) => {
+  // Set once a variant delete/save may have persisted, so the catch can
+  // refresh the product price summary from whatever variants remain.
+  let variantWritesStarted = false;
   try {
     const { productId } = req.params;
     const userId = req.user._id;
@@ -944,7 +945,7 @@ exports.updateProduct = async (req, res) => {
           return res.status(400).json({ code: 'PRODUCT_VALIDATION_FAILED', error: 'Each variant must be an object.' });
         }
         if (variant._id) {
-          if (!mongoose.Types.ObjectId.isValid(variant._id)) {
+          if (!/^[0-9a-f]{24}$/i.test(String(variant._id))) {
             return res.status(400).json({ code: 'PRODUCT_VARIANT_INVALID', error: 'Invalid variant ID' });
           }
           const variantIdKey = String(variant._id);
@@ -1038,6 +1039,7 @@ exports.updateProduct = async (req, res) => {
       const frontendVariantIds = variants.filter(v => v._id).map(v => v._id.toString());
 
       // Remove variants not in frontend payload
+      variantWritesStarted = true;
       await ProductVariant.deleteMany({
         productId,
         _id: { $nin: frontendVariantIds }
@@ -1118,6 +1120,7 @@ exports.updateProduct = async (req, res) => {
     } else if (hasVariantPayload) {
       // An explicit empty variants array removes all variants. A request
       // without a variants array leaves the existing variants untouched.
+      variantWritesStarted = true;
       await ProductVariant.deleteMany({ productId });
     }
 
@@ -1133,6 +1136,8 @@ exports.updateProduct = async (req, res) => {
         isPublished: true,
       });
       if (!publishCheck.ok) {
+        // Variant deletes/saves above already persisted.
+        await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
         return res.status(400).json({
           error: publishCheck.message,
           code: publishCheck.code,
@@ -1142,25 +1147,11 @@ exports.updateProduct = async (req, res) => {
 
     product.isPublished = nextPublished;
 
-    if (allVariants.length > 0) {
-      const prices = allVariants.map(v => {
-        const sale = v.salePrice ? parseFloat(v.salePrice.toString()) : null;
-        const price = parseFloat(v.price.toString());
-        return sale ?? price; // salePrice has priority
-      });
-
-      const minPrice = Math.min(...prices);
-      const maxPrice = Math.max(...prices);
-
-      product.price = Decimal128.fromString(minPrice.toString());
-      product.maxPrice = Decimal128.fromString(maxPrice.toString());
-      await product.save();
-    } else {
-      // No variants → reset product price
-      product.price = null;
-      product.maxPrice = null;
-      await product.save();
-    }
+    // Non-deleted variants only; a $0/empty sale price falls back to base price.
+    const priceSummary = summarizeVariantPrices(allVariants);
+    product.price = priceSummary.price;
+    product.maxPrice = priceSummary.maxPrice;
+    await product.save();
 
     if (replacedCoverImage) {
       await deleteReplacedProductMedia([replacedCoverImage], userId);
@@ -1174,6 +1165,9 @@ exports.updateProduct = async (req, res) => {
     });
   } catch (err) {
     console.error("Error updating product:", err);
+    if (variantWritesStarted) {
+      await recomputeProductPriceSummarySafe(req.params.productId, priceSummaryModels);
+    }
     return res.status(500).json({ error: "Internal server error" });
   }
 };
@@ -1437,6 +1431,7 @@ exports.addVariants = async (req, res) => {
     await Product.findByIdAndUpdate(productId, {
       $push: { variants: { $each: variantIds } },
     });
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
 
     return res.status(201).json({
       message: 'Variants added successfully',
@@ -1543,6 +1538,7 @@ exports.updateVariant = async (req, res) => {
     if (isPublished !== undefined) variant.isPublished = isPublished;
 
     await variant.save();
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
     await deleteReplacedProductMedia(imagesToDelete, req.user._id);
 
     // Auto-publish/unpublish product based on variants
@@ -1611,10 +1607,14 @@ exports.deleteVariant = async (req, res) => {
     // Soft delete
     variant.isDeleted = true;
     await variant.save();
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
 
-    // Remove from product's variants array
-    product.variants = product.variants.filter(v => v.toString() !== variantId);
-    
+    // Remove from product's variants array (not a Product schema path, so
+    // usually undefined; guard so the soft delete doesn't end in a 500)
+    if (Array.isArray(product.variants)) {
+      product.variants = product.variants.filter(v => v.toString() !== variantId);
+    }
+
     // Check if any published variants remain
     const publishedVariants = await ProductVariant.countDocuments({
       productId,
