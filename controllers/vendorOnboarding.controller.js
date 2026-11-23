@@ -148,6 +148,9 @@ exports.saveDraft = async (req, res) => {
 
     // 1️⃣ Check if onboarding exists
     let onboarding = await VendorOnboarding.findOne({ userId });
+    // Status as read. The save below only applies if it is unchanged, so a
+    // concurrent submit/approval can never be reverted by a stale draft save.
+    const statusAsRead = onboarding ? (onboarding.status ?? null) : undefined;
 
     // 1b️⃣ Raw API boundary validation for hasBusinessLicense before model operations
     if (payload.hasBusinessLicense !== undefined && typeof payload.hasBusinessLicense !== 'boolean') {
@@ -302,8 +305,22 @@ exports.saveDraft = async (req, res) => {
     } else if (!onboarding.status) {
       onboarding.status = 'draft';
     }
-    // 8️⃣ Save
-    await onboarding.save();
+    // 8️⃣ Save (conditional on the status we read; see statusAsRead)
+    if (!onboarding.isNew) {
+      onboarding.$where = { status: statusAsRead };
+    }
+    try {
+      await onboarding.save();
+    } catch (saveError) {
+      if (saveError?.name === 'DocumentNotFoundError') {
+        return res.status(409).json({
+          success: false,
+          code: 'APPLICATION_STATE_CHANGED',
+          message: 'Your application changed while saving. Please reload and try again.',
+        });
+      }
+      throw saveError;
+    }
 
     return res.status(200).json({
       success: true,
@@ -1082,6 +1099,8 @@ function isStripeResourceMissing(error) {
   return error?.code === 'resource_missing' || error?.statusCode === 404;
 }
 
+const PAYABLE_APPLICATION_STATUSES = Object.freeze(["draft", "payment_pending", "rejected"]);
+
 exports.createVerificationPayment = async (req, res) => {
   try {
     const userId = req.user._id;
@@ -1097,6 +1116,16 @@ exports.createVerificationPayment = async (req, res) => {
 
     if (onboarding.verificationPayment?.status === "paid") {
       return respondAlreadyPaid(res);
+    }
+
+    // A submitted or verified application must never be moved back to
+    // payment_pending (e.g. legacy records submitted before payment existed).
+    if (!PAYABLE_APPLICATION_STATUSES.includes(onboarding.status)) {
+      return res.status(409).json({
+        success: false,
+        code: 'APPLICATION_NOT_PAYABLE',
+        message: "This application is not awaiting a verification payment."
+      });
     }
 
     // Reuse existing unpaid PaymentIntent if still active on Stripe (idempotent recovery)
