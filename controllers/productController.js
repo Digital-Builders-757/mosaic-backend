@@ -245,11 +245,13 @@ const normalizeVariantPayload = (variant, options = {}) => {
   };
 };
 
-// Request publish flags: true / 'true' -> true, false / 'false' -> false,
-// anything else (missing, null, 1, 'yes', ...) -> undefined ("not sent").
+// Request publish flags: true / 'true' / 1 / '1' -> true,
+// false / 'false' / 0 / '0' -> false (the same inputs the routes' isBoolean
+// validators accept, so legacy clients keep their meaning); anything else
+// (missing, null, 'yes', ...) -> undefined ("not sent").
 const normalizePublishFlag = (value) => {
-  if (value === true || value === 'true') return true;
-  if (value === false || value === 'false') return false;
+  if (value === true || value === 'true' || value === 1 || value === '1') return true;
+  if (value === false || value === 'false' || value === 0 || value === '0') return false;
   return undefined;
 };
 

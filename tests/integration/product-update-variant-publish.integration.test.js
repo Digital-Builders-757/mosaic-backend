@@ -428,7 +428,7 @@ test('(g) string publish flags behave like booleans on product update; garbage f
   const garbage = await agent.put(`/api/product/${productId}`).send({
     isPublished: 'yes',
     variants: [
-      { _id: a._id, attributes: { Size: 'A' }, isPublished: 1 },
+      { _id: a._id, attributes: { Size: 'A' }, isPublished: 'maybe' },
       { _id: b._id, attributes: { Size: 'B' }, isPublished: 'nope' },
     ],
   });
@@ -436,6 +436,51 @@ test('(g) string publish flags behave like booleans on product update; garbage f
   assert.equal((await Product.findById(productId)).isPublished, false);
   assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
   assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+});
+
+test('(h) numeric 1/0 and "1"/"0" publish flags keep their boolean meaning on product update', async () => {
+  const { agent, business } = await setupVendor();
+  const { productId, a, b } = await createPublishedProduct(agent, business);
+
+  // Product-level 1, per-variant '1' / 0: B drafted, product stays published.
+  const mixed = await agent.put(`/api/product/${productId}`).send({
+    isPublished: 1,
+    variants: [
+      { _id: a._id, attributes: { Size: 'A' }, isPublished: '1' },
+      { _id: b._id, attributes: { Size: 'B' }, isPublished: 0 },
+    ],
+  });
+  assert.equal(mixed.status, 200, JSON.stringify(mixed.body));
+  assert.equal((await Product.findById(productId)).isPublished, true);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, true);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+
+  // Product-level '0' unpublishes and drafts flagless variants (explicit, not auto).
+  const zero = await agent.put(`/api/product/${productId}`).send({
+    isPublished: '0',
+    variants: [
+      { _id: a._id, attributes: { Size: 'A' } },
+      { _id: b._id, attributes: { Size: 'B' } },
+    ],
+  });
+  assert.equal(zero.status, 200, JSON.stringify(zero.body));
+  assert.equal(zero.body.autoUnpublished, undefined);
+  assert.equal((await Product.findById(productId)).isPublished, false);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+
+  // Product-level 0 then '1' with no per-variant flags republishes everything.
+  const one = await agent.put(`/api/product/${productId}`).send({
+    isPublished: '1',
+    variants: [
+      { _id: a._id, attributes: { Size: 'A' } },
+      { _id: b._id, attributes: { Size: 'B' } },
+    ],
+  });
+  assert.equal(one.status, 200, JSON.stringify(one.body));
+  assert.equal((await Product.findById(productId)).isPublished, true);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, true);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, true);
 });
 
 test('(e) every variant Draft with product isPublished:true unpublishes the product', async () => {

@@ -194,3 +194,46 @@ test('create: unrecognised publish values fall back (product draft; variant foll
   assert.equal((await Product.findById(published.body.product._id)).isPublished, true);
   assert.equal((await variantBySku(published.body.product._id, 'SYN-CVP-GB')).isPublished, true);
 });
+
+test('create: numeric 1/0 and "1"/"0" flags keep their boolean meaning (legacy clients)', async () => {
+  const { agent, business } = await setupVendor();
+
+  // Product-level 1 publishes (as Boolean(1) did before); per-variant 0 / '1'.
+  const one = await createProduct(agent, business, {
+    isPublished: 1,
+    variants: [
+      { attributes: { Size: 'A' }, sku: 'SYN-CVP-NA', price: 20, stock: 2, isPublished: '1' },
+      { attributes: { Size: 'B' }, sku: 'SYN-CVP-NB', price: 8, stock: 2, isPublished: 0 },
+    ],
+  });
+  assert.equal(one.status, 201, JSON.stringify(one.body));
+  const oneId = one.body.product._id;
+  assert.equal((await Product.findById(oneId)).isPublished, true);
+  assert.equal((await variantBySku(oneId, 'SYN-CVP-NA')).isPublished, true);
+  assert.equal((await variantBySku(oneId, 'SYN-CVP-NB')).isPublished, false);
+
+  // Product-level '1' string also publishes; flagless variants follow.
+  const stringOne = await createProduct(agent, business, {
+    isPublished: '1',
+    variants: [{ attributes: { Size: 'A' }, sku: 'SYN-CVP-N1', price: 20, stock: 2 }],
+  });
+  assert.equal(stringOne.status, 201, JSON.stringify(stringOne.body));
+  assert.equal((await Product.findById(stringOne.body.product._id)).isPublished, true);
+  assert.equal((await variantBySku(stringOne.body.product._id, 'SYN-CVP-N1')).isPublished, true);
+
+  // Product-level 0 / '0' create drafts; per-variant 1 still publishes that variant.
+  for (const [flag, sku] of [[0, 'SYN-CVP-N0'], ['0', 'SYN-CVP-NS0']]) {
+    const draft = await createProduct(agent, business, {
+      isPublished: flag,
+      variants: [
+        { attributes: { Size: 'A' }, sku, price: 20, stock: 2 },
+        { attributes: { Size: 'B' }, sku: `${sku}-P`, price: 25, stock: 2, isPublished: 1 },
+      ],
+    });
+    assert.equal(draft.status, 201, JSON.stringify(draft.body));
+    const draftId = draft.body.product._id;
+    assert.equal((await Product.findById(draftId)).isPublished, false, `flag=${JSON.stringify(flag)}`);
+    assert.equal((await variantBySku(draftId, sku)).isPublished, false);
+    assert.equal((await variantBySku(draftId, `${sku}-P`)).isPublished, true);
+  }
+});
