@@ -21,7 +21,7 @@ function parseArgs(argv) {
   }
   if (!values.directory || !values.output || !FULL_SHA.test(values['release-sha'] || '')
       || !['success', 'failure', 'cancelled'].includes(values['job-status'])
-      || (values['release-mode'] && !['release', 'rollback', 'focused-baseline', 'unknown'].includes(values['release-mode']))) {
+      || (values['release-mode'] && !['release', 'rollback', 'focused-baseline', 'legacy-retirement-bootstrap', 'unknown'].includes(values['release-mode']))) {
     throw new Error('Directory, output, full release SHA, and job status are required');
   }
   return values;

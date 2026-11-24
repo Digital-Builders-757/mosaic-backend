@@ -7,13 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Exact-main release, break-glass rollback, or focused-baseline preflight
+        description: Exact-main release, break-glass rollback, focused-baseline preflight, or one-time legacy-retirement bootstrap
         required: true
         type: choice
         options:
           - release
           - rollback
           - focused-baseline
+          # One-time only: deploys the FIRST main SHA that retires the legacy
+          # POST /api/payments/create-payment-intent route. Admissible only while
+          # vars.LEGACY_PAYMENT_RETIREMENT_SHA is unset (self-disabling) and
+          # vars.LEGACY_PAYMENT_RECONCILIATION_SHA256 is set. See
+          # docs/release/LEGACY_RETIREMENT_BOOTSTRAP.md.
+          - legacy-retirement-bootstrap
         default: release
       release_sha:
         description: Full exact target SHA
@@ -32,7 +38,7 @@ on:
         required: false
         type: string
       confirmation:
-        description: For rollback only, type BREAK GLASS ROLLBACK EXACT SHA
+        description: Rollback - type BREAK GLASS ROLLBACK EXACT SHA; legacy-retirement-bootstrap - type BOOTSTRAP LEGACY PAYMENT RETIREMENT EXACT SHA
         required: false
         type: string
 
@@ -85,6 +91,8 @@ jobs:
           BASELINE_SHA: ${{ inputs.baseline_sha }}
           RELEASE_REF: ${{ inputs.release_ref }}
           SOURCE_PR: ${{ inputs.source_pr }}
+          LEGACY_PAYMENT_RETIREMENT_SHA: ${{ vars.LEGACY_PAYMENT_RETIREMENT_SHA }}
+          LEGACY_PAYMENT_RECONCILIATION_SHA256: ${{ vars.LEGACY_PAYMENT_RECONCILIATION_SHA256 }}
         run: |
           node scripts/release/resolve-production-release.js \
             --event "$EVENT_NAME" \
@@ -96,6 +104,8 @@ jobs:
             --baseline-sha "$BASELINE_SHA" \
             --release-ref "$RELEASE_REF" \
             --source-pr "$SOURCE_PR" \
+            --legacy-retirement-sha "$LEGACY_PAYMENT_RETIREMENT_SHA" \
+            --legacy-reconciliation-sha256 "$LEGACY_PAYMENT_RECONCILIATION_SHA256" \
             --output release-evidence/release-identity.json
 
       - name: Upload release identity
@@ -200,7 +210,9 @@ jobs:
           persist-credentials: true
 
       - name: Verify canonical promotion and certificate
-        if: needs.resolve-release.outputs.release_mode == 'release'
+        # The legacy-retirement bootstrap targets the exact current main tip, so
+        # it must carry the same canonical staging promotion certificate.
+        if: needs.resolve-release.outputs.release_mode == 'release' || needs.resolve-release.outputs.release_mode == 'legacy-retirement-bootstrap'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ needs.resolve-release.outputs.release_sha }}
@@ -285,7 +297,10 @@ jobs:
             --output release-evidence/public-preflight.json
 
       - name: Bind retirement attestation to deployed and target ancestry
-        if: needs.resolve-release.outputs.release_mode != 'focused-baseline'
+        # Normal release and break-glass rollback keep this binding unchanged.
+        # Rollback limitation: a rollback target must itself descend from the
+        # recorded retirement SHA, so no rollback can reintroduce the legacy route.
+        if: needs.resolve-release.outputs.release_mode != 'focused-baseline' && needs.resolve-release.outputs.release_mode != 'legacy-retirement-bootstrap'
         env:
           RELEASE_SHA: ${{ needs.resolve-release.outputs.release_sha }}
           LEGACY_PAYMENT_RETIREMENT_SHA: ${{ vars.LEGACY_PAYMENT_RETIREMENT_SHA }}
@@ -298,6 +313,26 @@ jobs:
           observed_sha=$(node -e 'const f=require("./release-evidence/public-preflight.json");process.stdout.write(f.observedSha)')
           git -C release-control merge-base --is-ancestor "$LEGACY_PAYMENT_RETIREMENT_SHA" "$observed_sha"
           git -C release-control merge-base --is-ancestor "$LEGACY_PAYMENT_RETIREMENT_SHA" "$RELEASE_SHA"
+
+      - name: Bind one-time legacy retirement bootstrap to live and target history
+        # Replaces the circular "retirement SHA already live" requirement for the
+        # FIRST retired SHA only. It refuses once LEGACY_PAYMENT_RETIREMENT_SHA is
+        # recorded or once live production no longer exposes the legacy route.
+        if: needs.resolve-release.outputs.release_mode == 'legacy-retirement-bootstrap'
+        env:
+          RELEASE_SHA: ${{ needs.resolve-release.outputs.release_sha }}
+          LEGACY_PAYMENT_RETIREMENT_SHA: ${{ vars.LEGACY_PAYMENT_RETIREMENT_SHA }}
+          LEGACY_PAYMENT_RECONCILIATION_SHA256: ${{ vars.LEGACY_PAYMENT_RECONCILIATION_SHA256 }}
+        run: |
+          set -euo pipefail
+          observed_sha=$(node -e 'const f=require("./release-evidence/public-preflight.json");process.stdout.write(f.observedSha)')
+          node release-control/scripts/release/verify-legacy-retirement-bootstrap.js \
+            --repo release-control \
+            --observed-sha "$observed_sha" \
+            --release-sha "$RELEASE_SHA" \
+            --legacy-retirement-sha "$LEGACY_PAYMENT_RETIREMENT_SHA" \
+            --legacy-reconciliation-sha256 "$LEGACY_PAYMENT_RECONCILIATION_SHA256" \
+            --output release-evidence/legacy-retirement-bootstrap.json
 
       - name: Prove focused production baseline is still deployed
         if: needs.resolve-release.outputs.release_mode == 'focused-baseline'
@@ -403,6 +438,10 @@ jobs:
             if [ "${{ needs.resolve-release.outputs.release_mode }}" = "focused-baseline" ]; then
               echo "- Focused deployment path requires the checkout gate to remain active and release blockers to stay zero"
             fi
+            if [ "${{ needs.resolve-release.outputs.release_mode }}" = "legacy-retirement-bootstrap" ]; then
+              echo "- ONE-TIME legacy-retirement bootstrap: LEGACY_PAYMENT_RETIREMENT_SHA unset, reviewed reconciliation digest set, live SHA is an ancestor of the target and still mounts the legacy route, target retires it"
+              echo "- The dual-path checkout gate (orders/initiate + legacy payment-intent) stays active until the retired build is verified"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   production-approval-and-release:
@@ -439,6 +478,8 @@ jobs:
       SSM_RESERVATION_DOCUMENT_NAME: ${{ vars.SSM_RESERVATION_DOCUMENT_NAME }}
       SSM_RESERVATION_DOCUMENT_VERSION: ${{ vars.SSM_RESERVATION_DOCUMENT_VERSION }}
       SSM_RESERVATION_DOCUMENT_SHA256: ${{ vars.SSM_RESERVATION_DOCUMENT_SHA256 }}
+      LEGACY_PAYMENT_RETIREMENT_SHA: ${{ vars.LEGACY_PAYMENT_RETIREMENT_SHA }}
+      LEGACY_PAYMENT_RECONCILIATION_SHA256: ${{ vars.LEGACY_PAYMENT_RECONCILIATION_SHA256 }}
     steps:
       - name: Checkout exact approved release
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -467,6 +508,22 @@ jobs:
           if [ "$RELEASE_MODE" = "release" ] && [ "$current_main" != "$RELEASE_SHA" ]; then
             echo "::error::Approved candidate became stale while awaiting Production approval."
             exit 1
+          fi
+          if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
+            # Re-evaluated after the protected approval: the bootstrap must still
+            # target the exact main tip and must still be unused.
+            if [ "$current_main" != "$RELEASE_SHA" ]; then
+              echo "::error::Approved legacy-retirement bootstrap candidate became stale while awaiting Production approval."
+              exit 1
+            fi
+            if [ -n "$(printf '%s' "$LEGACY_PAYMENT_RETIREMENT_SHA" | tr -d '[:space:]')" ]; then
+              echo "::error::LEGACY_PAYMENT_RETIREMENT_SHA was recorded; the one-time bootstrap is disabled."
+              exit 1
+            fi
+            if [[ ! "$LEGACY_PAYMENT_RECONCILIATION_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Reviewed LEGACY_PAYMENT_RECONCILIATION_SHA256 is required for the bootstrap."
+              exit 1
+            fi
           fi
           if ! git cat-file -e "$RELEASE_SHA^{commit}" 2>/dev/null; then
             echo "::error::Approved release target is unavailable."
@@ -527,6 +584,11 @@ jobs:
           current_main=$(git rev-parse origin/main)
           test "$(git rev-parse HEAD)" = "$current_main"
           if [ "$RELEASE_MODE" = "release" ]; then
+            test "$current_main" = "$RELEASE_SHA"
+          elif [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
+            # Same exact-main binding as a normal release. The inherited
+            # RELEASE_MODE makes manage-checkout-gate.js enable the dual-path
+            # gate, because the live build still mounts the legacy route.
             test "$current_main" = "$RELEASE_SHA"
           elif [ "$RELEASE_MODE" = "focused-baseline" ]; then
             test "$FOCUSED_BASELINE_SHA" = "9bc75c257a9f483a287f122dbd38514b7a4b55d4"
@@ -626,8 +688,15 @@ jobs:
 
       - name: Verify exact public release while checkout stays gated
         run: |
+          # Only the bootstrap passes its mode here: while its dual-path gate is
+          # active the legacy path answers the ALB 503 instead of the app 404.
+          mode_args=()
+          if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
+            mode_args=(--release-mode "$RELEASE_MODE")
+          fi
           node scripts/release/verify-production-public-surfaces.js \
             --mode deployed \
+            "${mode_args[@]}" \
             --base-url "$PRODUCTION_API_URL" \
             --expected-sha "$RELEASE_SHA" \
             --output release-evidence/public-deployed.json
@@ -668,8 +737,14 @@ jobs:
         id: final-open
         if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' }}
         run: |
+          mode_args=()
+          if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
+            # Ungated proof of the retirement itself: legacy path must be 404/405.
+            mode_args=(--release-mode "$RELEASE_MODE")
+          fi
           node scripts/release/verify-production-public-surfaces.js \
             --mode ungated \
+            "${mode_args[@]}" \
             --base-url "$PRODUCTION_API_URL" \
             --expected-sha "$RELEASE_SHA" \
             --output release-evidence/public-ungated.json
@@ -724,6 +799,16 @@ jobs:
             --job-status "$JOB_STATUS" \
             --run-url "$RUN_URL" \
             --output release-evidence/production-release-evidence.json
+          if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ] && [ "$JOB_STATUS" = "success" ]; then
+            {
+              echo "## Legacy retirement bootstrap deployed"
+              echo ""
+              echo "Required human follow-up (disables the bootstrap permanently):"
+              echo "set repository variable LEGACY_PAYMENT_RETIREMENT_SHA=\`$RELEASE_SHA\`."
+              echo "Normal release and break-glass rollback then require this SHA to be an"
+              echo "ancestor of both live Production and every future target."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload complete release evidence
         if: always()

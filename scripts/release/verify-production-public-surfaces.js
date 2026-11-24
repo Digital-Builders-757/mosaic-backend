@@ -22,14 +22,15 @@ const CORS_ORIGINS = Object.freeze([
   'https://mosaic-biz-frontend-launch-git-main-digital-builders.vercel.app',
   'https://mosaic-biz-frontend-launch-git-develop-digital-builders.vercel.app',
 ]);
-const RELEASE_MODES = Object.freeze(['release', 'rollback', 'focused-baseline']);
+const LEGACY_RETIREMENT_BOOTSTRAP = 'legacy-retirement-bootstrap';
+const RELEASE_MODES = Object.freeze(['release', 'rollback', 'focused-baseline', LEGACY_RETIREMENT_BOOTSTRAP]);
 
 function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
     if (!argv[index]?.startsWith('--') || argv[index + 1] === undefined) {
       throw new Error(
-        'Usage: verify-production-public-surfaces.js --mode preflight|deployed|ungated [--release-mode release|rollback|focused-baseline] --base-url <url> --expected-sha <sha> --output <path> [preflight attestation options]'
+        'Usage: verify-production-public-surfaces.js --mode preflight|deployed|ungated [--release-mode release|rollback|focused-baseline|legacy-retirement-bootstrap] --base-url <url> --expected-sha <sha> --output <path> [preflight attestation options]'
       );
     }
     values[argv[index].slice(2)] = argv[index + 1];
@@ -52,7 +53,18 @@ function parseArgs(argv) {
     expectedSha: values['expected-sha'].toLowerCase(),
     output: values.output,
   };
-  if (result.mode === 'preflight' && result.releaseMode !== 'focused-baseline') {
+  if (result.mode === 'preflight' && result.releaseMode === LEGACY_RETIREMENT_BOOTSTRAP) {
+    // Self-disabling: once a retirement SHA is recorded, the bootstrap is
+    // refused and the normal attested release path applies.
+    if (String(values['legacy-retirement-sha'] || '').trim() !== '') {
+      throw new Error('Legacy retirement bootstrap is disabled once a legacy-retirement-sha is recorded');
+    }
+    if (!SHA256.test(values['legacy-reconciliation-sha256'] || '')) {
+      throw new Error('Legacy retirement bootstrap requires a reviewed legacy-reconciliation-sha256');
+    }
+    result.legacyRetirementSha = null;
+    result.legacyReconciliationSha256 = values['legacy-reconciliation-sha256'].toLowerCase();
+  } else if (result.mode === 'preflight' && result.releaseMode !== 'focused-baseline') {
     if (
       !FULL_SHA.test(values['legacy-retirement-sha'] || '')
       || !SHA256.test(values['legacy-reconciliation-sha256'] || '')
@@ -125,6 +137,7 @@ async function verifyProductionPublicSurfaces({
   fetchImpl = fetch,
 }) {
   if (!RELEASE_MODES.includes(releaseMode)) throw new Error('Unsupported release mode');
+  const bootstrap = releaseMode === LEGACY_RETIREMENT_BOOTSTRAP;
   const healthResponse = await requireStatus(fetchImpl, baseUrl, 'GET', '/api/health', [200]);
   const readyResponse = await requireStatus(fetchImpl, baseUrl, 'GET', '/api/ready', [200]);
   const buildResponse = await requireStatus(fetchImpl, baseUrl, 'GET', '/api/build-info', [200]);
@@ -179,6 +192,16 @@ async function verifyProductionPublicSurfaces({
   }
 
   let legacyPaymentStatus = null;
+  // Bootstrap: before deployment the live (pre-retirement) build still mounts
+  // the legacy route, so it must be either authenticated (401) or blocked by
+  // the dual-path ALB gate (503). A live 404/405 means the retirement is
+  // already deployed and the bootstrap must not run. While deployed-but-gated,
+  // the dual gate answers 503; once ungated, the retired build must 404/405.
+  const bootstrapLegacyStatuses = {
+    preflight: [401, 503],
+    deployed: [503],
+    ungated: [404, 405],
+  };
   const legacyResponse = await request(fetchImpl, `${baseUrl}${LEGACY_PAYMENT_PATH}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -187,13 +210,22 @@ async function verifyProductionPublicSurfaces({
   legacyPaymentStatus = legacyResponse.status;
   const expectedLegacyStatuses = releaseMode === 'focused-baseline'
     ? (mode === 'ungated' ? [401] : [503])
-    : [404, 405];
+    : bootstrap ? bootstrapLegacyStatuses[mode]
+      : [404, 405];
   if (!expectedLegacyStatuses.includes(legacyPaymentStatus)) {
     throw new Error(releaseMode === 'focused-baseline'
       ? `Focused legacy payment checkout gate is not in expected ${mode} state (HTTP ${legacyPaymentStatus})`
-      : `Legacy payment-intent route is still reachable (HTTP ${legacyPaymentStatus})`);
+      : bootstrap
+        ? (mode === 'preflight' && [404, 405].includes(legacyPaymentStatus)
+          ? 'Legacy route is already retired on live production; record LEGACY_PAYMENT_RETIREMENT_SHA and use the normal release path'
+          : `Legacy retirement bootstrap expected legacy route HTTP ${expectedLegacyStatuses.join(' or ')} in ${mode} state (HTTP ${legacyPaymentStatus})`)
+        : `Legacy payment-intent route is still reachable (HTTP ${legacyPaymentStatus})`);
   }
-  if (mode === 'preflight' && releaseMode !== 'focused-baseline') {
+  if (mode === 'preflight' && bootstrap) {
+    if (String(legacyRetirementSha || '').trim() !== '' || !SHA256.test(legacyReconciliationSha256 || '')) {
+      throw new Error('Legacy retirement bootstrap attestation is missing, malformed, or already recorded');
+    }
+  } else if (mode === 'preflight' && releaseMode !== 'focused-baseline') {
     if (!FULL_SHA.test(legacyRetirementSha || '') || !SHA256.test(legacyReconciliationSha256 || '')) {
       throw new Error('Legacy payment cutover attestation is missing or malformed');
     }
@@ -220,8 +252,9 @@ async function verifyProductionPublicSurfaces({
       legacyPaymentSurface: 'active-authenticated-baseline',
     } : {}),
     legacyPaymentCutover: mode === 'preflight' && releaseMode !== 'focused-baseline' ? {
-      retirementSha: legacyRetirementSha,
+      retirementSha: bootstrap ? null : legacyRetirementSha,
       reconciliationSha256: legacyReconciliationSha256,
+      ...(bootstrap ? { bootstrap: true, liveLegacyRouteStatus: legacyPaymentStatus } : {}),
     } : null,
     health: 'success',
     readiness: 'success',
@@ -248,6 +281,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  LEGACY_RETIREMENT_BOOTSTRAP,
   WEBHOOK_PATHS,
   CORS_ORIGINS,
   LEGACY_PAYMENT_PATH,
