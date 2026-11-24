@@ -83,6 +83,15 @@ exports.createFood = async (req, res) => {
       return res.status(403).json({ error: 'You do not own this business.' });
     }
 
+    // Food listings belong to food businesses only; product and
+    // other businesses have their own listing types.
+    if (business.listingType !== 'food') {
+      return res.status(403).json({
+        code: 'FOOD_BUSINESS_TYPE_MISMATCH',
+        error: 'Only food businesses can create food listings. Choose a food business.',
+      });
+    }
+
     const subscription = await Subscription.findOne({
       userId,
       status: 'active',
