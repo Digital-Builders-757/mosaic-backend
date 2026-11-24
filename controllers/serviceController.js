@@ -76,6 +76,10 @@ const getOwnerChildServiceCount = async (ownerId, excludeServiceId = null) => {
 exports.createParentService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
+  let committed = false;
 
   try {
     const {
@@ -197,7 +201,7 @@ exports.createParentService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     res.status(201).json({
       message: 'Parent service created successfully. You can now add child services.',
@@ -205,11 +209,15 @@ exports.createParentService = async (req, res) => {
     });
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
     console.error('Parent service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create parent service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
@@ -217,6 +225,10 @@ exports.createParentService = async (req, res) => {
 exports.createService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
+  let committed = false;
 
   try {
     const {
@@ -375,24 +387,31 @@ exports.createService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     return res.status(201).json(
       formatOwnerServiceResponse(service, business, 'Service created successfully.')
     );
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
-    const usedImages = [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
+    // After a commit the service exists, so its images must not be removed.
+    const usedImages = committed
+      ? []
+      : [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
     for (const image of usedImages) {
       await deleteCloudinaryFile(image).catch(() => { });
       await PendingImage.deleteOne({ url: image }).catch(() => { });
     }
 
     console.error('Service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
