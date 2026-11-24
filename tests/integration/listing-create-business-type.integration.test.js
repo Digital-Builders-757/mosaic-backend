@@ -115,3 +115,35 @@ test('a food business still creates its food listing', async () => {
   assert.equal(await Food.countDocuments({ businessId: businesses.food._id }), 1);
   assert.equal(await Food.countDocuments({ businessId: businesses.product._id }), 0);
 });
+
+test('a service business can create its parent service listing', async () => {
+  const { agent, businesses } = await vendorWith(['product', 'service']);
+  const created = await agent.post('/api/service/parent').send(await servicePayload(businesses.service));
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(await Service.countDocuments({ businessId: businesses.service._id }), 1);
+  assert.equal(await Service.countDocuments({ businessId: businesses.product._id }), 0);
+});
+
+test('child services cannot be added to a legacy listing under a non-service business', async () => {
+  const { agent, businesses } = await vendorWith(['product', 'service']);
+  // Create through the API under the service business, then simulate a legacy
+  // record filed under the goods business (created before the guard existed).
+  const created = await agent.post('/api/service/').send(await servicePayload(businesses.service));
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const serviceId = created.body?.data?.service?._id;
+  assert.ok(serviceId);
+
+  const child = [{ name: 'Beard Trim', price: 20, duration: '30' }];
+  const ok = await agent.post('/api/service/add-child-services')
+    .send({ parentServiceId: serviceId, childServices: child });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
+
+  await Service.updateOne({ _id: serviceId }, { $set: { businessId: businesses.product._id } });
+  const before = await Service.findById(serviceId).lean();
+  const rejected = await agent.post('/api/service/add-child-services')
+    .send({ parentServiceId: serviceId, childServices: [{ name: 'Colour', price: 30, duration: '60' }] });
+  assert.equal(rejected.status, 403, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.code, 'SERVICE_BUSINESS_TYPE_MISMATCH');
+  const after = await Service.findById(serviceId).lean();
+  assert.deepEqual(after.services, before.services);
+});

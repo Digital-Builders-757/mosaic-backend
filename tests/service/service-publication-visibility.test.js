@@ -52,7 +52,7 @@ function buildServiceDoc(overrides = {}) {
 function loadServiceController(options = {}) {
   const {
     existingService = null,
-    business = { _id: businessId, owner: ownerId, isActive: true, minorityType: 'none' },
+    business = { _id: businessId, owner: ownerId, isActive: true, minorityType: 'none', listingType: 'service' },
     subscription = { subscriptionPlanId: 'plan-1', status: 'active' },
     serviceLimit = 10,
   } = options;
@@ -152,11 +152,13 @@ function loadServiceController(options = {}) {
     }
     if (request.endsWith('models/Business')) {
       return {
+        // Awaitable directly (create controllers) and via .select() (others).
         findOne: () => ({
           select: () => ({
             exec: async () => business,
             then: (resolve, reject) => Promise.resolve(business).then(resolve, reject),
           }),
+          then: (resolve, reject) => Promise.resolve(business).then(resolve, reject),
         }),
         find: () => ({
           select: () => ({

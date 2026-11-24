@@ -584,7 +584,7 @@ exports.addChildServices = async (req, res) => {
       return res.status(400).json({ error: 'childServices must be a non-empty array.' });
     }
 
-    const withBusinessOwner = (query) => query.populate('businessId', 'owner');
+    const withBusinessOwner = (query) => query.populate('businessId', 'owner listingType');
 
     let parentService = null;
 
@@ -619,6 +619,14 @@ exports.addChildServices = async (req, res) => {
 
     if (!isOwner && !isBusinessOwnerUser) {
       return res.status(403).json({ error: 'You do not own this parent service/business.' });
+    }
+
+    // Same rule as the create routes: services only under a service business.
+    if (parentService.businessId?.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
     }
 
     const subscription = await Subscription.findOne({
