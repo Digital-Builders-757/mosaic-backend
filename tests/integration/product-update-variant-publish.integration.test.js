@@ -199,15 +199,14 @@ test('(d) derived product price and publication stay consistent with per-variant
 
   const stored = await Product.findById(productId);
   assert.equal(stored.isPublished, true, 'product stays published while a variant is published');
-  // #365: product.price is summarised from non-deleted variants via the shared
-  // helper; the stored value must match a fresh summary of what is persisted.
-  // Draft variants still count toward product.price ON PURPOSE: that is the
-  // pre-existing #365 rule, unchanged by this fix (changing it is follow-up
-  // W2). So the drafted $10 variant B still sets the price.
+  // #365: product.price is the lowest effective price among LIVE (published,
+  // non-deleted) variants, via the shared helper; the stored value must match
+  // a fresh summary of what is persisted. The drafted $10 variant B no longer
+  // sets the price, so the card shows A's $20.
   const persisted = await ProductVariant.find({ productId, isDeleted: { $ne: true } });
   const expected = summarizeVariantPrices(persisted);
   assert.equal(stored.price.toString(), expected.price.toString());
-  assert.equal(priceOf(stored), 10);
+  assert.equal(priceOf(stored), 20);
   assert.equal(Number(res.body.product.price.$numberDecimal), priceOf(stored));
 
   // Parity: the update-variant endpoint produces the same variant state and
@@ -238,8 +237,48 @@ test('(d) derived product price and publication stay consistent with per-variant
     summarizeVariantPrices(persistedAfter).price.toString()
   );
   assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
-  // Draft B ($8) still sets product.price under the #365 rule (see above).
-  assert.equal(priceOf(afterPriceChange), 8);
+  // Draft B ($8) is not live, so the live A ($22) sets product.price.
+  assert.equal(priceOf(afterPriceChange), 22);
+
+  // Republishing B makes its $8 the live minimum again.
+  const republishB = await agent
+    .put(`/api/product/update-variant/${productId}/${b._id}`)
+    .send({ isPublished: true });
+  assert.equal(republishB.status, 200, JSON.stringify(republishB.body));
+  assert.equal(priceOf(await Product.findById(productId)), 8);
+
+  // Soft-deleting the live A leaves only B (published) to price the product.
+  const deletedA = await agent.delete(`/api/product/delete-variant/${productId}/${a._id}`);
+  assert.equal(deletedA.status, 200, JSON.stringify(deletedA.body));
+  assert.equal(priceOf(await Product.findById(productId)), 8);
+});
+
+test('(d2) a fully Draft product keeps a fallback price from all non-deleted variants', async () => {
+  const { agent, business } = await setupVendor();
+  const { productId, a, b } = await createPublishedProduct(agent, business);
+
+  // All variants Draft through product update: the product is unpublished and
+  // product.price falls back to the non-deleted variants (lowest $10).
+  const res = await agent.put(`/api/product/${productId}`).send({
+    isPublished: true,
+    variants: [
+      { _id: a._id, attributes: { Size: 'A' }, isPublished: false },
+      { _id: b._id, attributes: { Size: 'B' }, price: 12, isPublished: false },
+    ],
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const stored = await Product.findById(productId);
+  assert.equal(stored.isPublished, false);
+  assert.equal(priceOf(stored), 12);
+
+  // Publishing only A through update-variant makes A's $20 the live price.
+  const publishA = await agent
+    .put(`/api/product/update-variant/${productId}/${a._id}`)
+    .send({ isPublished: true });
+  assert.equal(publishA.status, 200, JSON.stringify(publishA.body));
+  const afterPublish = await Product.findById(productId);
+  assert.equal(afterPublish.isPublished, true);
+  assert.equal(priceOf(afterPublish), 20);
 });
 
 test('(e) every variant Draft with product isPublished:true unpublishes the product', async () => {
