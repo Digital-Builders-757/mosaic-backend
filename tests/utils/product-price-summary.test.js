@@ -74,6 +74,57 @@ test('soft-deleted variants are excluded', () => {
   );
 });
 
+test('Draft (isPublished:false) variants do not set the price when a live variant is priced', () => {
+  assert.deepEqual(
+    summaryOf([
+      { price: dec('8'), isPublished: false },
+      { price: dec('20'), isPublished: true },
+      { price: dec('30'), salePrice: dec('25'), isPublished: true },
+      { price: dec('99'), isPublished: false },
+    ]),
+    { price: 20, maxPrice: 25 }
+  );
+});
+
+test('variants without an isPublished field count as live (same test as the publish check)', () => {
+  assert.deepEqual(
+    summaryOf([{ price: dec('15') }, { price: dec('5'), isPublished: false }]),
+    { price: 15, maxPrice: 15 }
+  );
+});
+
+test('all variants Draft falls back to all non-deleted variants', () => {
+  assert.deepEqual(
+    summaryOf([
+      { price: dec('12'), isPublished: false },
+      { price: dec('30'), salePrice: dec('18'), isPublished: false },
+      { price: dec('4'), isPublished: false, isDeleted: true },
+    ]),
+    { price: 12, maxPrice: 18 }
+  );
+});
+
+test('live variants with no usable price yield null; a Draft price is never used', () => {
+  assert.deepEqual(
+    summaryOf([
+      { price: dec('0'), salePrice: dec('0'), isPublished: true },
+      { price: dec('14'), isPublished: false },
+    ]),
+    { price: null, maxPrice: null }
+  );
+});
+
+test('a deleted live variant does not set the price', () => {
+  assert.deepEqual(
+    summaryOf([
+      { price: dec('3'), isPublished: true, isDeleted: true },
+      { price: dec('9'), isPublished: false },
+      { price: dec('11'), isPublished: true },
+    ]),
+    { price: 11, maxPrice: 11 }
+  );
+});
+
 test('no variants (or only deleted / unusable ones) yields null price fields', () => {
   assert.deepEqual(summarizeVariantPrices([]), { price: null, maxPrice: null });
   assert.deepEqual(summarizeVariantPrices(undefined), { price: null, maxPrice: null });

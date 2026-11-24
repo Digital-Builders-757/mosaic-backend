@@ -438,7 +438,7 @@ exports.createProductWithVariants = async (req, res) => {
       });
     }
 
-    const willPublish = Boolean(isPublished);
+    let willPublish = Boolean(isPublished);
 
     if (!Array.isArray(variants) || variants.length === 0) {
       return res.status(400).json({ code: 'PRODUCT_VALIDATION_FAILED', error: 'At least one variant is required.' });
@@ -533,9 +533,15 @@ for (const [index, variant] of variants.entries()) {
     stock: normalizedVariant.stock,
     shipping: normalizeVariantShipping(variant.shipping),
     images: variant.images || [],
-    isPublished: willPublish,
+    isPublished: resolveVariantPublished(variant, willPublish, false),
   });
 }
+
+    // Publishing with every variant in Draft creates the product unpublished
+    // (same rule as updateProduct), rather than an empty published listing.
+    if (willPublish && variantDocs.every((doc) => doc.isPublished !== true)) {
+      willPublish = false;
+    }
 
     if (willPublish) {
       const publishCheck = validateProductPublishState({
@@ -1588,6 +1594,9 @@ exports.updateVariant = async (req, res) => {
       if (!publishCheck.ok) {
         variant.isPublished = false;
         await variant.save();
+        // The summary above counted this variant as live; refresh it now
+        // that the variant is back in Draft.
+        await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
         return res.status(400).json({
           error: publishCheck.message,
           code: publishCheck.code,

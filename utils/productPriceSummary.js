@@ -3,17 +3,34 @@ const { getVariantEffectivePrice } = require('../lib/marketplace/listingPricePol
 
 const { Decimal128 } = mongoose.Types;
 
+const effectivePrices = (variants) =>
+  variants
+    .map((variant) => getVariantEffectivePrice(variant))
+    .filter((price) => price !== null);
+
 // Pure summary of the product-level price fields from a list of variants.
 // Uses the listing policy's effective price (sale if > 0, else price if > 0,
 // else null), so Decimal128("0") sales and $0 base prices never become the
 // card price. Soft-deleted variants and variants without a positive price are
 // skipped. Returns nulls when none remain, matching Product.price's
 // "null if no variants yet" default.
+//
+// The price comes from LIVE variants: non-deleted and not Draft
+// (isPublished !== false, the same "published" test the listing price policy
+// uses for the publish check), so a card never advertises a Draft variant's
+// price. Fallback: only when there are NO live variants at all (every
+// non-deleted variant is Draft, as on a fully draft/hidden product), all
+// non-deleted variants are used instead, so the editor still has a sensible
+// stored price. If live variants exist but none has a usable price, the
+// result is null ("Price on request"): a Draft variant's price is never shown
+// for a product whose buyable variants are unpriced.
 function summarizeVariantPrices(variants = []) {
-  const prices = (Array.isArray(variants) ? variants : [])
-    .filter((variant) => variant && variant.isDeleted !== true)
-    .map((variant) => getVariantEffectivePrice(variant))
-    .filter((price) => price !== null);
+  const nonDeleted = (Array.isArray(variants) ? variants : []).filter(
+    (variant) => variant && variant.isDeleted !== true
+  );
+  const live = nonDeleted.filter((variant) => variant.isPublished !== false);
+
+  const prices = live.length > 0 ? effectivePrices(live) : effectivePrices(nonDeleted);
 
   if (prices.length === 0) {
     return { price: null, maxPrice: null };
@@ -40,7 +57,7 @@ async function recomputeProductPriceSummary(
 
   const variants = await ProductVariant.find(
     { productId, isDeleted: { $ne: true } },
-    'price salePrice isDeleted',
+    'price salePrice isDeleted isPublished',
     session ? { session } : undefined
   );
 
