@@ -467,12 +467,13 @@ function cliConfiguration(argv, env = process.env, fixtureConfiguration = {}) {
   if (hasExplicitReleaseMode && hasInheritedReleaseMode && explicitReleaseMode !== inheritedReleaseMode) {
     throw new Error('--release-mode must match inherited RELEASE_MODE');
   }
-  // Rollback uses the existing canonical checkout gate, as it did before the
-  // environment mode was bound here. An explicit rollback gate mode remains unsupported.
+  // Break-glass rollback uses the canonical (release) checkout gate whether the
+  // mode is inherited from RELEASE_MODE or passed explicitly with
+  // --release-mode (the production workflow passes it explicitly). The
+  // flag/environment agreement check above still applies.
   const requestedReleaseMode = hasExplicitReleaseMode ? explicitReleaseMode
     : hasInheritedReleaseMode ? inheritedReleaseMode : 'release';
-  const releaseMode = requestedReleaseMode === 'rollback' && !hasExplicitReleaseMode
-    ? 'release' : requestedReleaseMode;
+  const releaseMode = requestedReleaseMode === 'rollback' ? 'release' : requestedReleaseMode;
   const from = (fixtureName, envName, fallback) =>
     fixtureConfiguration[fixtureName] || env[envName] || fallback;
   const disabledPath = exactPath(
