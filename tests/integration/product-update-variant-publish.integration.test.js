@@ -483,6 +483,112 @@ test('(h) numeric 1/0 and "1"/"0" publish flags keep their boolean meaning on pr
   assert.equal((await ProductVariant.findById(b._id)).isPublished, true);
 });
 
+// Unpublished product whose variants are all Draft (priced A $20, B $10).
+async function createDraftProduct(agent, business, suffix) {
+  const created = await agent.post('/api/product').send({
+    title: 'Synthetic Draft Product',
+    description: 'Synthetic product created as a draft',
+    categoryId: new mongoose.Types.ObjectId().toString(),
+    subcategoryId: new mongoose.Types.ObjectId().toString(),
+    businessId: business._id.toString(),
+    coverImage: 'https://example.test/draft-product.webp',
+    isPublished: false,
+    variants: [
+      { attributes: { Size: 'A' }, sku: `SYN-DR-${suffix}-A`, price: 20, stock: 2 },
+      { attributes: { Size: 'B' }, sku: `SYN-DR-${suffix}-B`, price: 10, stock: 2 },
+    ],
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const productId = created.body.product._id;
+  const a = created.body.variants.find((v) => v.sku.endsWith(`SYN-DR-${suffix}-A`));
+  const b = created.body.variants.find((v) => v.sku.endsWith(`SYN-DR-${suffix}-B`));
+  const stored = await Product.findById(productId);
+  assert.equal(stored.isPublished, false);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
+  // The stored price is the all-Draft fallback (#387), not a live price.
+  assert.equal(priceOf(stored), 10);
+  return { productId, a, b };
+}
+
+test('(i) publish without a variants payload on an all-Draft product is rejected; stored price is not a stand-in', async () => {
+  const { agent, business } = await setupVendor();
+  const { productId, a, b } = await createDraftProduct(agent, business, 'NV');
+
+  const res = await agent.put(`/api/product/${productId}`).send({ isPublished: true });
+  assert.equal(res.status, 400, JSON.stringify(res.body));
+  assert.equal(res.body.code, 'LISTING_PRICE_REQUIRED');
+  assert.equal((await Product.findById(productId)).isPublished, false);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+});
+
+test('(j) variants: [] never leaves a product published with no variants', async () => {
+  const { agent, business } = await setupVendor();
+
+  // Explicit publish with an empty array: rejected before anything is deleted.
+  const first = await createPublishedProduct(agent, business);
+  const rejected = await agent.put(`/api/product/${first.productId}`).send({
+    isPublished: true,
+    variants: [],
+  });
+  assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.code, 'LISTING_PRICE_REQUIRED');
+  assert.equal(await ProductVariant.countDocuments({ productId: first.productId }), 2);
+  assert.equal((await Product.findById(first.productId)).isPublished, true);
+
+  // No publish flag: the edit (remove all variants) stands, product unpublished.
+  const res = await agent.put(`/api/product/${first.productId}`).send({ variants: [] });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.autoUnpublished, true);
+  assert.equal(await ProductVariant.countDocuments({ productId: first.productId }), 0);
+  const after = await Product.findById(first.productId);
+  assert.equal(after.isPublished, false);
+  assert.equal(after.price, null);
+});
+
+test('(k) a title-only edit on a healthy published product keeps it published', async () => {
+  const { agent, business } = await setupVendor();
+  const { productId, a, b } = await createPublishedProduct(agent, business);
+
+  const res = await agent.put(`/api/product/${productId}`).send({ title: 'Synthetic Renamed Product' });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.autoUnpublished, undefined);
+  const after = await Product.findById(productId);
+  assert.equal(after.title, 'Synthetic Renamed Product');
+  assert.equal(after.isPublished, true);
+  assert.equal(priceOf(after), 10);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, true);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, true);
+});
+
+test('(l) update-variant normalises string flags: "false" drafts a $0 variant; "true" auto-publishes', async () => {
+  const { agent, business } = await setupVendor();
+
+  // 'false' on the live $0 variant: a Draft, so no price check and no 400.
+  const priced = await createPricedAndUnpricedProduct(agent, business, 'SF');
+  const drafted = await agent
+    .put(`/api/product/update-variant/${priced.productId}/${priced.b._id}`)
+    .send({ isPublished: 'false' });
+  assert.equal(drafted.status, 200, JSON.stringify(drafted.body));
+  assert.equal((await ProductVariant.findById(priced.b._id)).isPublished, false);
+  // The priced A is still live, so the product stays published at $10.
+  const afterDraft = await Product.findById(priced.productId);
+  assert.equal(afterDraft.isPublished, true);
+  assert.equal(priceOf(afterDraft), 10);
+
+  // 'true' on a priced variant of an unpublished product: same auto-publish
+  // path as boolean true.
+  const draft = await createDraftProduct(agent, business, 'ST');
+  const published = await agent
+    .put(`/api/product/update-variant/${draft.productId}/${draft.a._id}`)
+    .send({ isPublished: 'true' });
+  assert.equal(published.status, 200, JSON.stringify(published.body));
+  assert.equal((await ProductVariant.findById(draft.a._id)).isPublished, true);
+  const afterPublish = await Product.findById(draft.productId);
+  assert.equal(afterPublish.isPublished, true);
+  assert.equal(priceOf(afterPublish), 20);
+});
+
 test('(e) every variant Draft with product isPublished:true unpublishes the product', async () => {
   const { agent, business } = await setupVendor();
   const { productId, a, b } = await createPublishedProduct(agent, business);
