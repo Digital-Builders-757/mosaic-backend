@@ -18,21 +18,19 @@ const effectivePrices = (variants) =>
 // The price comes from LIVE variants: non-deleted and not Draft
 // (isPublished !== false, the same "published" test the listing price policy
 // uses for the publish check), so a card never advertises a Draft variant's
-// price. Fallback: when no live variant has a usable price (e.g. every
-// variant is Draft, as on a fully draft/hidden product), all non-deleted
-// variants are used instead, so the editor still has a sensible stored price.
-// The publish check requires a priced live variant, so the fallback normally
-// only applies to unpublished products.
+// price. Fallback: only when there are NO live variants at all (every
+// non-deleted variant is Draft, as on a fully draft/hidden product), all
+// non-deleted variants are used instead, so the editor still has a sensible
+// stored price. If live variants exist but none has a usable price, the
+// result is null ("Price on request"): a Draft variant's price is never shown
+// for a product whose buyable variants are unpriced.
 function summarizeVariantPrices(variants = []) {
   const nonDeleted = (Array.isArray(variants) ? variants : []).filter(
     (variant) => variant && variant.isDeleted !== true
   );
   const live = nonDeleted.filter((variant) => variant.isPublished !== false);
 
-  let prices = effectivePrices(live);
-  if (prices.length === 0) {
-    prices = effectivePrices(nonDeleted);
-  }
+  const prices = live.length > 0 ? effectivePrices(live) : effectivePrices(nonDeleted);
 
   if (prices.length === 0) {
     return { price: null, maxPrice: null };

@@ -281,6 +281,43 @@ test('(d2) a fully Draft product keeps a fallback price from all non-deleted var
   assert.equal(priceOf(afterPublish), 20);
 });
 
+test('(d3) drafting the only priced variant leaves an unpriced live variant: price null, product published', async () => {
+  const { agent, business } = await setupVendor();
+  const created = await agent.post('/api/product').send({
+    title: 'Synthetic Price On Request Product',
+    description: 'Synthetic product: live $10 variant drafted, live $0 variant remains',
+    categoryId: new mongoose.Types.ObjectId().toString(),
+    subcategoryId: new mongoose.Types.ObjectId().toString(),
+    businessId: business._id.toString(),
+    coverImage: 'https://example.test/price-on-request.webp',
+    isPublished: true,
+    variants: [
+      { attributes: { Size: 'A' }, sku: 'SYN-POR-A', price: 10, stock: 2 },
+      { attributes: { Size: 'B' }, sku: 'SYN-POR-B', price: 0, stock: 2 },
+    ],
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const productId = created.body.product._id;
+  const a = created.body.variants.find((v) => v.sku.endsWith('SYN-POR-A'));
+  const b = created.body.variants.find((v) => v.sku.endsWith('SYN-POR-B'));
+  const before = await Product.findById(productId);
+  assert.equal(before.isPublished, true);
+  assert.equal(priceOf(before), 10);
+
+  const res = await agent
+    .put(`/api/product/update-variant/${productId}/${a._id}`)
+    .send({ isPublished: false });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, true);
+  const after = await Product.findById(productId);
+  // B is still live, so the product stays published; its only live variant is
+  // unpriced, so the card price is null ("Price on request"), not Draft A's $10.
+  assert.equal(after.isPublished, true);
+  assert.equal(after.price, null);
+});
+
 test('(e) every variant Draft with product isPublished:true unpublishes the product', async () => {
   const { agent, business } = await setupVendor();
   const { productId, a, b } = await createPublishedProduct(agent, business);

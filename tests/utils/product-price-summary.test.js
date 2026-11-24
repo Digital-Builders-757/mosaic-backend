@@ -104,13 +104,13 @@ test('all variants Draft falls back to all non-deleted variants', () => {
   );
 });
 
-test('live variants with no usable price fall back to all non-deleted variants', () => {
+test('live variants with no usable price yield null; a Draft price is never used', () => {
   assert.deepEqual(
     summaryOf([
       { price: dec('0'), salePrice: dec('0'), isPublished: true },
       { price: dec('14'), isPublished: false },
     ]),
-    { price: 14, maxPrice: 14 }
+    { price: null, maxPrice: null }
   );
 });
 
