@@ -15,6 +15,8 @@
  *   - vendor A product storefront with stock-tracked variants (cart/stock).
  *   - vendor B product storefront with no listings: a below-cap product vendor
  *     for create/edit QA, so vendor A's fixture products stay untouched.
+ *   - a second vendor A service storefront with an unpublished draft listing,
+ *     for switching between two service businesses on Add Service.
  *
  * No Stripe objects are referenced: Connect fields stay unset and the
  * subscription ids are synthetic placeholders, never Stripe ids.
@@ -278,7 +280,8 @@ function buildFixtureSpec() {
     subscriptionEntry('subscription.vendorA.product', 'vendorA', 'business.vendorA.product'),
     subscriptionEntry('subscription.vendorA.service', 'vendorA', 'business.vendorA.service'),
     subscriptionEntry('subscription.foodVendor', 'foodVendor', 'business.foodVendor'),
-    subscriptionEntry('subscription.vendorB.product', 'vendorB', 'business.vendorB.product')
+    subscriptionEntry('subscription.vendorB.product', 'vendorB', 'business.vendorB.product'),
+    subscriptionEntry('subscription.vendorA.service2', 'vendorA', 'business.vendorA.service2')
   );
 
   entries.push(
@@ -330,6 +333,20 @@ function buildFixtureSpec() {
       subscriptionKey: 'subscription.vendorB.product',
       // Starts empty (below the plan cap) for product create/edit QA.
       refs: () => ({ products: [], usage: { totalProducts: 0 } }),
+    }),
+    businessEntry({
+      key: 'business.vendorA.service2',
+      ownerRole: 'vendorA',
+      name: 'Vendor A Services 2 (switch test)',
+      slug: 'mbh-synthetic-vendor-a-services-2',
+      listingType: 'service',
+      subscriptionKey: 'subscription.vendorA.service2',
+      // Second service business for Add Service business-switch QA (#537).
+      refs: (ctx) => ({
+        services: [ctx.id('service.consult2')],
+        serviceCategories: [ctx.id('service.category')],
+        usage: { totalServices: 1 },
+      }),
     })
   );
 
@@ -395,6 +412,39 @@ function buildFixtureSpec() {
       isPublished: true,
       isActive: true,
       coverImage: `${ASSET_BASE}/consultation.png`,
+      maxBookingsPerSlot: 1,
+      rfqEnabled: false,
+      businessHours: listingHours(),
+      contact: { email: ctx.emails.vendorA, address: '100 Example Way, Norfolk, VA' },
+    }),
+  });
+
+  entries.push({
+    key: 'service.consult2',
+    model: 'Service',
+    unique: () => ({ slug: 'mbh-synthetic-second-consultation' }),
+    build: (ctx) => ({
+      title: `${NAME_PREFIX} Second Consultation (switch test draft)`,
+      slug: 'mbh-synthetic-second-consultation',
+      description: 'Synthetic unpublished service draft for staging QA of switching businesses. Not a real offer.',
+      price: 40,
+      duration: '45 minutes',
+      services: [
+        {
+          name: 'Switch-test session',
+          description: 'Synthetic 45 minute slot',
+          durationMinutes: 45,
+          price: 40,
+        },
+      ],
+      categoryId: ctx.id('service.category'),
+      subcategoryId: ctx.id('service.subcategory'),
+      ownerId: ctx.id(ROLES.vendorA.userKey),
+      businessId: ctx.id('business.vendorA.service2'),
+      // Draft: never shown on the public storefront.
+      isPublished: false,
+      isActive: true,
+      coverImage: `${ASSET_BASE}/second-consultation.png`,
       maxBookingsPerSlot: 1,
       rfqEnabled: false,
       businessHours: listingHours(),

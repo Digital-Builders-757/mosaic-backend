@@ -16,8 +16,8 @@ const DB_NAME = 'mbh_fixture_it_staging';
 const EXPECTED_COUNTS = {
   User: 5,
   VendorOnboardingStage1: 3,
-  Subscription: 4,
-  Business: 4,
+  Subscription: 5,
+  Business: 5,
   ProductCategory: 1,
   ProductSubcategory: 1,
   ServiceCategory: 1,
@@ -26,7 +26,7 @@ const EXPECTED_COUNTS = {
   FoodSubcategory: 1,
   Product: 2,
   ProductVariant: 2,
-  Service: 1,
+  Service: 2,
   Food: 1,
 };
 const EXPECTED_TOTAL = Object.values(EXPECTED_COUNTS).reduce((a, b) => a + b, 0);
@@ -244,8 +244,15 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       const variants = await mongoose.model('ProductVariant').find({ fixtureTag: FIXTURE_TAG }).lean();
       assert.deepEqual(variants.map((v) => v.stock).sort(), [1, 5]);
 
-      const service = await mongoose.model('Service').findOne({ fixtureTag: FIXTURE_TAG }).lean();
+      const service = await mongoose.model('Service').findOne({ fixtureTag: FIXTURE_TAG, fixtureKey: 'service.consult' }).lean();
       assert.ok(service.isPublished);
+      // The second Vendor A service business holds an unpublished draft only.
+      const draft = await mongoose.model('Service').findOne({ fixtureTag: FIXTURE_TAG, fixtureKey: 'service.consult2' }).lean();
+      assert.equal(draft.isPublished, false);
+      const draftBusiness = await mongoose.model('Business').findById(draft.businessId).lean();
+      assert.equal(draftBusiness.listingType, 'service');
+      assert.equal(String(draftBusiness.owner), String(service.ownerId));
+      assert.notEqual(String(draftBusiness._id), String(service.businessId));
       assert.ok(service.services.length >= 1 && service.services.every((s) => s.durationMinutes > 0));
       assert.ok(service.businessHours.some((h) => !h.closed));
 
@@ -253,7 +260,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       assert.ok(food.bookingTimeSlots.length > 0);
 
       const businesses = await mongoose.model('Business').find({ fixtureTag: FIXTURE_TAG }).lean();
-      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'product', 'service']);
+      assert.deepEqual(businesses.map((b) => b.listingType).sort(), ['food', 'product', 'product', 'service', 'service']);
       for (const b of businesses) {
         assert.equal(b.stripeConnectAccountId, undefined);
         assert.equal(b.chargesEnabled, false);
