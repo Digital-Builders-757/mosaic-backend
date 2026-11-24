@@ -379,6 +379,14 @@ exports.createProductWithVariants = async (req, res) => {
     if (!business) {
       return res.status(403).json({ error: 'You do not own this business.' });
     }
+    // Goods listings belong to product businesses only; service and food
+    // businesses have their own listing types.
+    if (business.listingType !== 'product') {
+      return res.status(403).json({
+        code: 'PRODUCT_BUSINESS_TYPE_MISMATCH',
+        error: 'Only product businesses can create product listings. Choose a product business.',
+      });
+    }
 
     // Check subscription
     const subscription = await Subscription.findOne({
