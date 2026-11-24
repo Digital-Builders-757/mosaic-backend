@@ -73,12 +73,24 @@ the `STRIPE_RECONCILIATION_READ_KEY` environment variable, and roll it after
 use. Creating/rolling the key is a Stripe dashboard action for the account
 owner.
 
+`--stripe-account` is **verified, not just a label**: before listing anything,
+`export` calls `GET /v1/account` with the restricted key and refuses to continue
+unless the returned `id` equals `--stripe-account` exactly. The export records
+`stripe.accountVerifiedBy: "GET /v1/account"`. If Stripe denies that call to the
+restricted key (HTTP 401/403), the export fails closed; grant the narrowest
+**read** permission that allows retrieving the account itself (never a write
+permission, never a Connect-wide permission) and re-run. Do not work around a
+denial by dropping the check.
+
 ## Exact Stripe queries (GET only)
 
 Authoritative enumeration uses the **List** endpoint (strongly consistent,
 supports a `created` window). The script issues exactly:
 
 ```text
+GET https://api.stripe.com/v1/account          # once; id must equal --stripe-account
+Authorization: Bearer rk_<mode>_…
+
 GET https://api.stripe.com/v1/payment_intents
     ?limit=100
     &created[gte]=<unix>          # default 1751328000 = 2025-07-01T00:00:00Z
@@ -86,6 +98,10 @@ GET https://api.stripe.com/v1/payment_intents
     [&starting_after=<last pi id>] # auto-pagination until has_more=false
 Authorization: Bearer rk_<mode>_…
 ```
+
+Pagination fails closed: a page with `has_more: true` and an empty `data` array,
+or a page without a boolean `has_more`, aborts the export instead of silently
+ending it (a truncated enumeration would understate the liability).
 
 Equivalent manual call for a spot check (test account shown; use the live key
 and identical parameters for live):
@@ -190,8 +206,19 @@ Reviewers fill only `entries[].resolution`, `entries[].reviewerNote`, and the
 `review` block: `decision` must be exactly
 `approved-no-outstanding-legacy-liability`, `reviewers` lists GitHub handles,
 `reviewedAt` is an ISO timestamp. Amounts are integers in minor units. The
-record contains no secrets or customer contact data, so it can be attached to
-the release evidence (private repository location chosen by the release owner).
+record contains no secrets or customer contact data, but it is still
+production financial data.
+
+### Where the reviewed record is stored
+
+The reviewed `record.json` **and** its `record.canonical.json` are stored by the
+release owner in the **Mosaic launch tracker** (the private Notion launch
+tracker, linked from the release issue
+`Digital-Builders-757/mosaic-biz-frontend-launch#498`), **never in the public
+repository** and never in a PR, issue body, or workflow log. The release issue
+references only the private artifact location and the digest. A second person
+verifies by downloading both files from the tracker and recomputing the hash
+with `digest` (and `sha256sum` on the canonical file), as described below.
 
 ## Digest (`LEGACY_PAYMENT_RECONCILIATION_SHA256`)
 
@@ -227,10 +254,18 @@ Independent check: `sha256sum recon/live/record.canonical.json` must equal the
 printed digest; a second reviewer can recompute from `record.json` with the
 same script at the same commit.
 
+**The digest is attestation-only.** It proves that the record the release
+owner stored in the Mosaic launch tracker is byte-for-byte the record that was
+reviewed; it does not itself check Stripe or MongoDB, and the release workflow
+does not (and cannot) re-derive it from live data. Its value therefore depends
+entirely on the reviewed record being retained in the tracker so anyone can
+recompute it with `digest`. A digest whose record cannot be produced is not
+evidence.
+
 ## What this procedure never does
 
 - No Stripe writes (no cancel, refund, capture, update) and no SDK import; the
-  only HTTP call is `GET /v1/payment_intents`.
+  only HTTP calls are `GET /v1/account` and `GET /v1/payment_intents`.
 - No MongoDB writes; the orders export is produced by a read-only user.
 - No GitHub variable changes; the release owner sets
   `LEGACY_PAYMENT_RECONCILIATION_SHA256` after review.

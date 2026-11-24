@@ -15,6 +15,7 @@ const {
   requireReadKey,
   sha256Hex,
   stripeGet,
+  verifyStripeAccount,
 } = require('../../scripts/release/legacy-payment-reconciliation');
 
 const scriptPath = path.resolve(__dirname, '../../scripts/release/legacy-payment-reconciliation.js');
@@ -49,13 +50,27 @@ function jsonResponse(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
+const ACCOUNT_BODY = { object: 'account', id: 'acct_platform' };
+
+// Routes GET /v1/account to the account body and serves list pages in order.
+function stripeFake(pages, { account = ACCOUNT_BODY, requests = [] } = {}) {
+  let pageIndex = 0;
+  return async (url, options) => {
+    requests.push({ url, options });
+    if (new URL(url).pathname === '/v1/account') return jsonResponse(account);
+    const page = pages[pageIndex];
+    pageIndex += 1;
+    return jsonResponse(page);
+  };
+}
+
 test('script source never references a mutating Stripe surface or the SDK', () => {
   const source = fs.readFileSync(scriptPath, 'utf8');
   assert.doesNotMatch(source, /require\(\s*['"]stripe['"]\s*\)/);
   assert.doesNotMatch(source, /method:\s*['"](POST|DELETE|PUT|PATCH)['"]/i);
   assert.doesNotMatch(source, /(paymentIntents|refunds|charges|transfers)\s*\./);
   assert.doesNotMatch(source, /\/refunds|\/cancel|\/capture|\/confirm/);
-  assert.deepEqual(ALLOWED_GET_PATHS, ['/v1/payment_intents']);
+  assert.deepEqual(ALLOWED_GET_PATHS, ['/v1/payment_intents', '/v1/account']);
 });
 
 test('only restricted keys whose mode matches the requested account mode are accepted', () => {
@@ -75,7 +90,10 @@ test('stripeGet refuses non-allowlisted URLs before any network call', async () 
   for (const url of [
     'https://api.stripe.com/v1/refunds',
     'https://api.stripe.com/v1/payment_intents/pi_1/cancel',
+    'https://api.stripe.com/v1/accounts/acct_1',
+    'https://api.stripe.com/v1/accounts',
     'https://evil.example/v1/payment_intents',
+    'https://evil.example/v1/account',
   ]) {
     await assert.rejects(() => stripeGet(fetchImpl, 'rk_test_x', new URL(url)), /allowlist/);
   }
@@ -93,10 +111,7 @@ test('export paginates with GET only, enforces livemode, and allowlists fields',
       intent({ id: 'pi_c', metadata: { subscriptionId: 'sub_1', userId: 'u' } }),
     ] },
   ];
-  const fetchImpl = async (url, options) => {
-    requests.push({ url, options });
-    return jsonResponse(pages[requests.length - 1]);
-  };
+  const fetchImpl = stripeFake(pages, { requests });
   const result = await exportIntents({
     key: 'rk_test_read',
     accountMode: 'test',
@@ -106,8 +121,10 @@ test('export paginates with GET only, enforces livemode, and allowlists fields',
     fetchImpl,
     now: () => new Date('2026-11-24T00:00:00Z'),
   });
-  assert.equal(requests.length, 2);
-  for (const request of requests) {
+  assert.equal(requests.length, 3);
+  assert.equal(new URL(requests[0].url).pathname, '/v1/account', 'account is verified before listing');
+  assert.equal(requests[0].options.method, 'GET');
+  for (const request of requests.slice(1)) {
     assert.equal(request.options.method, 'GET');
     assert.equal(request.options.headers.Authorization, 'Bearer rk_test_read');
     const url = new URL(request.url);
@@ -115,7 +132,8 @@ test('export paginates with GET only, enforces livemode, and allowlists fields',
     assert.equal(url.searchParams.get('created[gte]'), '1751328000');
     assert.equal(url.searchParams.get('created[lte]'), '1790000000');
   }
-  assert.equal(new URL(requests[1].url).searchParams.get('starting_after'), 'pi_a');
+  assert.equal(new URL(requests[2].url).searchParams.get('starting_after'), 'pi_a');
+  assert.equal(result.stripe.accountVerifiedBy, 'GET /v1/account');
   assert.deepEqual(result.intents.map((item) => item.paymentIntentId), ['pi_a', 'pi_b', 'pi_c']);
   assert.deepEqual(result.counts, { total: 3, legacy: 1, canonicalOrder: 1, other: 1 });
   const serialized = JSON.stringify(result);
@@ -125,8 +143,54 @@ test('export paginates with GET only, enforces livemode, and allowlists fields',
     key: 'rk_live_read',
     accountMode: 'live',
     stripeAccountId: 'acct_platform',
-    fetchImpl: async () => jsonResponse({ object: 'list', has_more: false, data: [intent({ id: 'pi_t', livemode: false })] }),
+    fetchImpl: stripeFake([{ object: 'list', has_more: false, data: [intent({ id: 'pi_t', livemode: false })] }]),
   }), /livemode/);
+});
+
+test('export fails closed when a page claims has_more but carries no data', async () => {
+  const exportWith = (pages) => exportIntents({
+    key: 'rk_test_read',
+    accountMode: 'test',
+    stripeAccountId: 'acct_platform',
+    createdGte: 1751328000,
+    createdLte: 1790000000,
+    fetchImpl: stripeFake(pages),
+  });
+  await assert.rejects(() => exportWith([
+    { object: 'list', has_more: true, data: [] },
+  ]), /has_more with an empty page/);
+  await assert.rejects(() => exportWith([
+    { object: 'list', has_more: true, data: [intent({ id: 'pi_a', metadata: { orderId: ORDER_A } })] },
+    { object: 'list', has_more: true, data: [] },
+  ]), /has_more with an empty page/);
+  await assert.rejects(() => exportWith([
+    { object: 'list', data: [] },
+  ]), /Unexpected Stripe list response/);
+  // An empty final page (has_more: false) is a legitimate empty window.
+  const empty = await exportWith([{ object: 'list', has_more: false, data: [] }]);
+  assert.equal(empty.counts.total, 0);
+});
+
+test('--stripe-account is verified against GET /v1/account before any listing', async () => {
+  const requests = [];
+  const run = (account, stripeAccountId = 'acct_platform') => exportIntents({
+    key: 'rk_live_read',
+    accountMode: 'live',
+    stripeAccountId,
+    createdGte: 1751328000,
+    createdLte: 1790000000,
+    fetchImpl: stripeFake([{ object: 'list', has_more: false, data: [] }], { account, requests }),
+  });
+  await assert.rejects(() => run({ object: 'account', id: 'acct_other' }), /belongs to acct_other, not --stripe-account acct_platform/);
+  assert.equal(requests.length, 1, 'no PaymentIntent list call after an account mismatch');
+  assert.equal(new URL(requests[0].url).pathname, '/v1/account');
+  await assert.rejects(() => run({ object: 'list', data: [] }), /Unexpected Stripe account response/);
+  await assert.rejects(() => run({ object: 'account' }), /Unexpected Stripe account response/);
+  await assert.rejects(() => run(ACCOUNT_BODY, 'platform'), /acct_ id/);
+
+  assert.equal(await verifyStripeAccount(stripeFake([]), 'rk_live_read', 'acct_platform'), 'acct_platform');
+  const denied = async () => jsonResponse({ error: { type: 'invalid_request_error' } }, 403);
+  await assert.rejects(() => verifyStripeAccount(denied, 'rk_live_read', 'acct_platform'), /GET \/v1\/account returned HTTP 403/);
 });
 
 test('legacy shape is exactly metadata {orderId} with no Connect transfer or fee', () => {

@@ -5,8 +5,12 @@
 // legacy route (POST /api/payments/create-payment-intent).
 //
 // Safety contract (enforced in code and covered by tests):
-// - Stripe is only ever called with HTTP GET on an allowlisted list endpoint.
-//   There is no Stripe SDK import, so no mutating helper is reachable.
+// - Stripe is only ever called with HTTP GET on allowlisted endpoints: the
+//   PaymentIntents list and GET /v1/account (to prove which account the key
+//   belongs to). There is no Stripe SDK import, so no mutating helper is
+//   reachable.
+// - --stripe-account is verified, not just a label: GET /v1/account must
+//   return exactly that acct_ id before any PaymentIntent is listed.
 // - Only restricted keys (rk_test_ / rk_live_) are accepted, and the key mode
 //   must match --account-mode. Use a restricted key with PaymentIntents: Read
 //   and nothing else.
@@ -23,7 +27,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const STRIPE_API_ORIGIN = 'https://api.stripe.com';
-const ALLOWED_GET_PATHS = Object.freeze(['/v1/payment_intents']);
+const ALLOWED_GET_PATHS = Object.freeze(['/v1/payment_intents', '/v1/account']);
 const RECORD_KIND = 'mosaic-legacy-payment-reconciliation';
 const EXPORT_KIND = 'mosaic-legacy-payment-stripe-export';
 const APPROVED_DECISION = 'approved-no-outstanding-legacy-liability';
@@ -110,6 +114,17 @@ async function stripeGet(fetchImpl, key, url) {
   return response.json();
 }
 
+async function verifyStripeAccount(fetchImpl, key, expectedAccountId) {
+  const body = await stripeGet(fetchImpl, key, new URL('/v1/account', STRIPE_API_ORIGIN));
+  if (!body || body.object !== 'account' || typeof body.id !== 'string') {
+    throw new Error('Unexpected Stripe account response');
+  }
+  if (body.id !== expectedAccountId) {
+    throw new Error(`Restricted key belongs to ${body.id}, not --stripe-account ${expectedAccountId}`);
+  }
+  return body.id;
+}
+
 function metadataKeys(intent) {
   return Object.keys(intent.metadata || {}).sort();
 }
@@ -163,6 +178,7 @@ async function exportIntents({
     throw new Error('Created window bounds must be unix seconds');
   }
   const upperBound = createdLte ?? Math.floor(now().getTime() / 1000);
+  await verifyStripeAccount(fetchImpl, readKey, stripeAccountId);
   const intents = [];
   let startingAfter;
   for (let page = 0; page < 10000; page += 1) {
@@ -172,7 +188,7 @@ async function exportIntents({
       'created[lte]': upperBound,
       starting_after: startingAfter,
     }));
-    if (!body || body.object !== 'list' || !Array.isArray(body.data)) {
+    if (!body || body.object !== 'list' || !Array.isArray(body.data) || typeof body.has_more !== 'boolean') {
       throw new Error('Unexpected Stripe list response');
     }
     for (const intent of body.data) {
@@ -182,7 +198,12 @@ async function exportIntents({
       }
       intents.push(reduceIntent(intent));
     }
-    if (!body.has_more || body.data.length === 0) {
+    if (body.has_more === true && body.data.length === 0) {
+      // A page that claims more results but carries none would silently
+      // truncate the enumeration; fail closed instead.
+      throw new Error('Stripe returned has_more with an empty page; refusing a possibly truncated export');
+    }
+    if (body.has_more !== true) {
       startingAfter = undefined;
       break;
     }
@@ -194,9 +215,14 @@ async function exportIntents({
     schemaVersion: 1,
     kind: EXPORT_KIND,
     exportedAt: now().toISOString(),
-    stripe: { accountId: stripeAccountId, accountMode, livemode: accountMode === 'live' },
+    stripe: {
+      accountId: stripeAccountId,
+      accountMode,
+      livemode: accountMode === 'live',
+      accountVerifiedBy: 'GET /v1/account',
+    },
     window: { createdGte, createdLte: upperBound },
-    request: 'GET /v1/payment_intents?limit=100&created[gte]&created[lte] (auto-paginated)',
+    request: 'GET /v1/account; GET /v1/payment_intents?limit=100&created[gte]&created[lte] (auto-paginated)',
     counts: {
       total: intents.length,
       legacy: intents.filter((item) => item.shape === 'legacy').length,
@@ -452,4 +478,5 @@ module.exports = {
   sha256Hex,
   stripeGet,
   validateReviewedRecord,
+  verifyStripeAccount,
 };
