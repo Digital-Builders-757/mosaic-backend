@@ -9,7 +9,9 @@ const FULL_SHA = /^[a-f0-9]{40}$/i;
 const ROLLBACK_CONFIRMATION = 'BREAK GLASS ROLLBACK EXACT SHA';
 const FOCUSED_BASELINE_SHA = '9bc75c257a9f483a287f122dbd38514b7a4b55d4';
 const FOCUSED_REF = /^refs\/heads\/release\/focused\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const SHA256 = /^[a-f0-9]{64}$/i;
+// The reviewed reconciliation digest is compared byte-for-byte downstream
+// (approval-job re-check, evidence), so it must be lowercase hex everywhere.
+const SHA256 = /^[a-f0-9]{64}$/;
 // One-time bootstrap for the first release that retires the legacy
 // POST /api/payments/create-payment-intent route. The normal release path
 // requires LEGACY_PAYMENT_RETIREMENT_SHA to already be live, which is circular
@@ -100,13 +102,13 @@ function resolveProductionRelease({
       throw new Error('Legacy retirement bootstrap is disabled: LEGACY_PAYMENT_RETIREMENT_SHA is already recorded; use release or rollback');
     }
     if (!SHA256.test(String(legacyReconciliationSha256 || ''))) {
-      throw new Error('Legacy retirement bootstrap requires the reviewed LEGACY_PAYMENT_RECONCILIATION_SHA256');
+      throw new Error('Legacy retirement bootstrap requires the reviewed LEGACY_PAYMENT_RECONCILIATION_SHA256 as 64 lowercase hex characters');
     }
     if (candidate !== currentMainSha.toLowerCase()) {
       throw new Error('Legacy retirement bootstrap candidate must equal the exact current main tip');
     }
     legacyRetirementBootstrap = {
-      reconciliationSha256: String(legacyReconciliationSha256).toLowerCase(),
+      reconciliationSha256: String(legacyReconciliationSha256),
       retirementShaRecorded: false,
     };
   } else {

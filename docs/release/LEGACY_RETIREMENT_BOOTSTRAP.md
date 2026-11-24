@@ -27,7 +27,7 @@ mounts the route (currently masked by the active ALB checkout gate, `503`).
 | `workflow_dispatch` only, phrase `BOOTSTRAP LEGACY PAYMENT RETIREMENT EXACT SHA` | `resolve-production-release.js` |
 | Target == exact current `main` tip (same as `release`) | resolver, approval re-check, gate step |
 | `vars.LEGACY_PAYMENT_RETIREMENT_SHA` **unset** (self-disabling) | resolver, public preflight, binding step, re-checked after approval |
-| `vars.LEGACY_PAYMENT_RECONCILIATION_SHA256` is 64 hex | resolver, public preflight, binding step, re-checked after approval |
+| `vars.LEGACY_PAYMENT_RECONCILIATION_SHA256` is 64 **lowercase** hex (uppercase/mixed case is refused at the resolver, never case-folded) | resolver, public preflight, binding step, re-checked after approval |
 | Canonical staging-promotion source certificate (cannot be skipped) | `verify-source` (`verify-main-release-source.js`) |
 | Exact-SHA unit/contract/integration suites | `exact-ci` |
 | Target route table: canonical `401`, every legacy spelling `404`/`405`, legacy POST route absent from the Express stack | `target-checkout-surface` |
@@ -35,6 +35,7 @@ mounts the route (currently masked by the active ALB checkout gate, `503`).
 | Live legacy route is `401` or `503` (pre-retirement); a live `404`/`405` refuses the bootstrap | `verify-production-public-surfaces.js --release-mode legacy-retirement-bootstrap` |
 | Live SHA is an ancestor of the target; live **tree** still exposes the legacy route; target tree is exclusive | `verify-legacy-retirement-bootstrap.js` (Git only) |
 | Read-only AWS topology and drain | `aws-preflight` (unchanged) |
+| After approval, before any mutation: live SHA self-reported by `/api/build-info` equals the EB `VersionLabel` `mosaic-<sha>` from the re-run read-only topology preflight, and the Git binding is re-proven against it | approval job, `verify-legacy-retirement-bootstrap.js --eb-version-label` |
 | **`production-release-control` environment approval** | unchanged mutating job |
 | Dual-path ALB gate (orders/initiate **and** legacy path) active through deploy | `manage-checkout-gate.js` / `verify-checkout-gate.sh` in bootstrap mode |
 | Zero reservation blockers before and after deploy | unchanged |

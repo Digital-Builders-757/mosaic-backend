@@ -5,7 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const FULL_SHA = /^[a-f0-9]{40}$/i;
-const SHA256 = /^[a-f0-9]{64}$/i;
+// Lowercase only: the reconciliation digest must match the reviewed value
+// byte-for-byte at every stage (resolver, preflight, approval re-check).
+const SHA256 = /^[a-f0-9]{64}$/;
 const LEGACY_PAYMENT_PATH = '/api/payments/create-payment-intent';
 const WEBHOOK_PATHS = Object.freeze([
   '/api/webhooks/stripe',
@@ -42,7 +44,7 @@ function parseArgs(argv) {
       || !FULL_SHA.test(values['expected-sha'] || '')
       || !values.output) {
     throw new Error(
-      'Usage: verify-production-public-surfaces.js --mode preflight|deployed|ungated [--release-mode release|rollback|focused-baseline] --base-url <url> --expected-sha <sha> --output <path> [preflight attestation options]'
+      'Usage: verify-production-public-surfaces.js --mode preflight|deployed|ungated [--release-mode release|rollback|focused-baseline|legacy-retirement-bootstrap] --base-url <url> --expected-sha <sha> --output <path> [preflight attestation options]'
     );
   }
 
@@ -60,21 +62,21 @@ function parseArgs(argv) {
       throw new Error('Legacy retirement bootstrap is disabled once a legacy-retirement-sha is recorded');
     }
     if (!SHA256.test(values['legacy-reconciliation-sha256'] || '')) {
-      throw new Error('Legacy retirement bootstrap requires a reviewed legacy-reconciliation-sha256');
+      throw new Error('Legacy retirement bootstrap requires a reviewed legacy-reconciliation-sha256 (64 lowercase hex)');
     }
     result.legacyRetirementSha = null;
-    result.legacyReconciliationSha256 = values['legacy-reconciliation-sha256'].toLowerCase();
+    result.legacyReconciliationSha256 = values['legacy-reconciliation-sha256'];
   } else if (result.mode === 'preflight' && result.releaseMode !== 'focused-baseline') {
     if (
       !FULL_SHA.test(values['legacy-retirement-sha'] || '')
       || !SHA256.test(values['legacy-reconciliation-sha256'] || '')
     ) {
       throw new Error(
-        'Preflight requires a full legacy-retirement-sha and reviewed legacy-reconciliation-sha256'
+        'Preflight requires a full legacy-retirement-sha and reviewed legacy-reconciliation-sha256 (64 lowercase hex)'
       );
     }
     result.legacyRetirementSha = values['legacy-retirement-sha'].toLowerCase();
-    result.legacyReconciliationSha256 = values['legacy-reconciliation-sha256'].toLowerCase();
+    result.legacyReconciliationSha256 = values['legacy-reconciliation-sha256'];
   }
   return result;
 }

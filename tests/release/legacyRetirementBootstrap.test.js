@@ -280,12 +280,72 @@ test('bootstrap binding proves forward ancestry, a live legacy tree, and an excl
     assert.throws(call({ legacyRetirementSha: retired }), /disabled/);
     assert.throws(call({ legacyReconciliationSha256: '' }), /RECONCILIATION/);
     assert.throws(call({ observedSha: retired }), /already live/);
+    // Optional EB VersionLabel cross-check (approval job, before mutation).
+    const withLabel = call({ ebVersionLabel: `mosaic-${legacy}` })();
+    assert.equal(withLabel.ebVersionLabel, `mosaic-${legacy}`);
+    assert.equal(withLabel.liveShaMatchesEbVersionLabel, true);
+    assert.equal(ok.ebVersionLabel, undefined, 'label fields only appear when cross-checked');
+    assert.throws(call({ ebVersionLabel: `mosaic-${retired}` }), /does not match EB VersionLabel/);
+    assert.throws(call({ ebVersionLabel: '' }), /does not match EB VersionLabel \(missing\)/);
+    assert.throws(call({ ebVersionLabel: legacy }), /does not match EB VersionLabel/);
+    assert.throws(call({ ebVersionLabel: `mosaic-${legacy.toUpperCase()}` }), /does not match EB VersionLabel/);
     assert.throws(call({ observedSha: retired, releaseSha: later }), /no longer exposes/);
     assert.throws(call({ observedSha: retired, releaseSha: legacy }), /not an ancestor/);
     assert.throws(call({ observedSha: legacy, releaseSha: legacy }), /already live/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('reconciliation digest must be lowercase at resolver, preflight and binding (no late failure)', () => {
+  const upper = DIGEST.toUpperCase();
+  const mixed = `${'C'.repeat(32)}${'c'.repeat(32)}`;
+  for (const digest of [upper, mixed]) {
+    assert.throws(() => resolveProductionRelease(bootstrapInput({ legacyReconciliationSha256: digest })), /lowercase hex/);
+    const base = ['--mode', 'preflight', '--base-url', 'https://api.example.test', '--expected-sha', MAIN, '--output', 'x.json'];
+    assert.throws(() => parsePublicArgs([...base, '--release-mode', LEGACY_RETIREMENT_BOOTSTRAP,
+      '--legacy-retirement-sha', '', '--legacy-reconciliation-sha256', digest]), /lowercase hex/);
+    // Normal release preflight applies the same rule.
+    assert.throws(() => parsePublicArgs([...base, '--legacy-retirement-sha', LIVE,
+      '--legacy-reconciliation-sha256', digest]), /lowercase hex/);
+    assert.throws(() => verifyLegacyRetirementBootstrap({
+      git: { isAncestor: () => true, text: () => '' },
+      observedSha: LIVE, releaseSha: MAIN, legacyRetirementSha: '', legacyReconciliationSha256: digest,
+    }), /lowercase hex/);
+  }
+  // Lowercase values pass through unchanged (no silent case folding anywhere).
+  assert.equal(resolveProductionRelease(bootstrapInput()).legacyRetirementBootstrap.reconciliationSha256, DIGEST);
+  const parsed = parsePublicArgs(['--mode', 'preflight', '--base-url', 'https://api.example.test',
+    '--expected-sha', MAIN, '--output', 'x.json', '--legacy-retirement-sha', LIVE, '--legacy-reconciliation-sha256', DIGEST]);
+  assert.equal(parsed.legacyReconciliationSha256, DIGEST);
+  // The approval-job re-check uses the same lowercase-only pattern.
+  assert.match(workflowSource, /\[\[ ! "\$LEGACY_PAYMENT_RECONCILIATION_SHA256" =~ \^\[0-9a-f\]\{64\}\$ \]\]/);
+});
+
+test('public-surface usage strings list every supported release mode', () => {
+  for (const argv of [
+    ['--mode'],
+    ['--mode', 'bogus', '--base-url', 'https://api.example.test', '--expected-sha', MAIN, '--output', 'x.json'],
+  ]) {
+    assert.throws(() => parsePublicArgs(argv), (error) => {
+      assert.match(error.message, /--release-mode release\|rollback\|focused-baseline\|legacy-retirement-bootstrap/);
+      return true;
+    });
+  }
+});
+
+test('approval job cross-checks the bootstrap live SHA against the EB VersionLabel before mutation', () => {
+  const approvalJob = workflowSource.slice(workflowSource.indexOf('  production-approval-and-release:'), workflowSource.indexOf('  release-summary:'));
+  const revalidate = approvalJob.indexOf('- name: Revalidate topology before mutation');
+  const download = approvalJob.indexOf('- name: Download bootstrap public preflight');
+  const crossCheck = approvalJob.indexOf('- name: Cross-check bootstrap live SHA against EB VersionLabel');
+  const gate = approvalJob.indexOf('- name: Enable exact checkout gate');
+  assert.ok(revalidate > 0 && revalidate < download && download < crossCheck && crossCheck < gate);
+  const step = approvalJob.slice(crossCheck, gate);
+  assert.match(step, /if: env\.RELEASE_MODE == 'legacy-retirement-bootstrap'/);
+  assert.match(step, /aws-approved-preflight\.json[\s\S]*currentVersion/);
+  assert.match(step, /--eb-version-label "\$eb_version"/);
+  assert.match(approvalJob.slice(download, crossCheck), /if: env\.RELEASE_MODE == 'legacy-retirement-bootstrap'[\s\S]*name: production-public-preflight-\$\{\{ needs\.resolve-release\.outputs\.release_sha \}\}/);
 });
 
 test('workflow wires the bootstrap behind the same approval without weakening release or rollback', () => {

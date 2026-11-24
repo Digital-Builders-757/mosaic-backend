@@ -575,6 +575,32 @@ jobs:
               --output release-evidence/aws-approved-preflight.json
           fi
 
+      - name: Download bootstrap public preflight
+        if: env.RELEASE_MODE == 'legacy-retirement-bootstrap'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: production-public-preflight-${{ needs.resolve-release.outputs.release_sha }}
+          path: bootstrap-public-preflight
+
+      - name: Cross-check bootstrap live SHA against EB VersionLabel
+        # Read-only and before any mutation: the live SHA self-reported by
+        # /api/build-info (public preflight) must equal the EB environment
+        # VersionLabel mosaic-<sha> just read by the approved topology preflight,
+        # and the bootstrap Git binding is re-proven against that SHA.
+        if: env.RELEASE_MODE == 'legacy-retirement-bootstrap'
+        run: |
+          set -euo pipefail
+          observed_sha=$(node -e 'const f=require("./bootstrap-public-preflight/public-preflight.json");process.stdout.write(String(f.observedSha||""))')
+          eb_version=$(node -e 'const f=require("./release-evidence/aws-approved-preflight.json");process.stdout.write(String(f.currentVersion||""))')
+          node scripts/release/verify-legacy-retirement-bootstrap.js \
+            --repo . \
+            --observed-sha "$observed_sha" \
+            --eb-version-label "$eb_version" \
+            --release-sha "$RELEASE_SHA" \
+            --legacy-retirement-sha "$LEGACY_PAYMENT_RETIREMENT_SHA" \
+            --legacy-reconciliation-sha256 "$LEGACY_PAYMENT_RECONCILIATION_SHA256" \
+            --output release-evidence/legacy-retirement-bootstrap-approved.json
+
       - name: Enable exact checkout gate
         id: gate
         run: |

@@ -13,6 +13,11 @@
 // - the live production tree still exposes the legacy route (so this really is
 //   the first retirement, not a replay after the retirement is already live);
 // - the exact target tree exposes only the canonical checkout initiator.
+// - optionally (--eb-version-label, used after Production approval and before
+//   any mutation), the self-reported live SHA from /api/build-info equals the
+//   EB environment VersionLabel `mosaic-<sha>` recorded by the read-only
+//   aws-release-topology preflight, so a misreporting build cannot steer the
+//   ancestry and legacy-tree proofs.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -89,19 +94,29 @@ function verifyLegacyRetirementBootstrap({
   releaseSha,
   legacyRetirementSha,
   legacyReconciliationSha256,
+  ebVersionLabel,
   clock,
 }) {
   if (String(legacyRetirementSha || '').trim() !== '') {
     throw new Error('Legacy retirement bootstrap is disabled: LEGACY_PAYMENT_RETIREMENT_SHA is already recorded');
   }
-  const digest = String(legacyReconciliationSha256 || '').toLowerCase();
+  // No case folding: the digest must already be the lowercase value that the
+  // resolver, preflight and approval re-check all accept.
+  const digest = String(legacyReconciliationSha256 || '');
   if (!SHA256.test(digest)) {
-    throw new Error('Legacy retirement bootstrap requires LEGACY_PAYMENT_RECONCILIATION_SHA256');
+    throw new Error('Legacy retirement bootstrap requires LEGACY_PAYMENT_RECONCILIATION_SHA256 as 64 lowercase hex characters');
   }
   const live = String(observedSha || '').toLowerCase();
   const target = String(releaseSha || '').toLowerCase();
   if (!FULL_SHA.test(live) || !FULL_SHA.test(target)) {
     throw new Error('Observed and release SHAs must be full SHAs');
+  }
+  if (ebVersionLabel !== undefined && ebVersionLabel !== null) {
+    if (String(ebVersionLabel) !== `mosaic-${live}`) {
+      throw new Error(
+        `Self-reported live SHA ${live} does not match EB VersionLabel ${String(ebVersionLabel) || '(missing)'}`
+      );
+    }
   }
   if (live === target) throw new Error('Release target is already live');
   if (!git.isAncestor(live, target)) {
@@ -126,6 +141,9 @@ function verifyLegacyRetirementBootstrap({
     liveTreeExposesLegacyRoute: true,
     targetTreeExclusiveCanonical: true,
     legacyRetirementShaRecorded: false,
+    ...(ebVersionLabel !== undefined && ebVersionLabel !== null
+      ? { ebVersionLabel: String(ebVersionLabel), liveShaMatchesEbVersionLabel: true }
+      : {}),
     reconciliationSha256: digest,
     productionMutation: false,
     nextAction: 'After a successful bootstrap release, the release owner records '
@@ -143,6 +161,9 @@ function main(argv = process.argv.slice(2), dependencies = {}) {
     releaseSha: requireOption(options, '--release-sha'),
     legacyRetirementSha: options['--legacy-retirement-sha'] || '',
     legacyReconciliationSha256: options['--legacy-reconciliation-sha256'] || '',
+    ebVersionLabel: Object.prototype.hasOwnProperty.call(options, '--eb-version-label')
+      ? String(options['--eb-version-label'] ?? '')
+      : undefined,
     clock: dependencies.clock,
   });
   (dependencies.writeJson || writeJson)(output, result);
