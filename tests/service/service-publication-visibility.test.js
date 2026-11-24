@@ -55,6 +55,7 @@ function loadServiceController(options = {}) {
     business = { _id: businessId, owner: ownerId, isActive: true, minorityType: 'none', listingType: 'service' },
     subscription = { subscriptionPlanId: 'plan-1', status: 'active' },
     serviceLimit = 10,
+    sessionLog = [],
   } = options;
 
   const savedDocs = [];
@@ -62,10 +63,10 @@ function loadServiceController(options = {}) {
 
   const Service = {
     startSession: async () => ({
-      startTransaction: () => {},
-      commitTransaction: async () => {},
-      abortTransaction: async () => {},
-      endSession: () => {},
+      startTransaction: () => { sessionLog.push('start'); },
+      commitTransaction: async () => { sessionLog.push('commit'); },
+      abortTransaction: async () => { sessionLog.push('abort'); },
+      endSession: () => { sessionLog.push('end'); },
     }),
     findOne: async (query) => {
       if (query._id === serviceId || (query.businessId && query.ownerId)) {
@@ -659,4 +660,30 @@ test('createParentService persists faq, amenities, and normalized business hours
   assert.deepEqual(savedDocs[0].faq, [{ question: 'Q', answer: 'A' }]);
   assert.deepEqual(savedDocs[0].amenities, [{ label: 'Parking', available: false }]);
   assert.deepEqual(savedDocs[0].businessHours, [{ day: 'Friday', hours: '08:00-16:00', closed: false }]);
+});
+
+const createBody = {
+  businessId,
+  categoryId: '507f1f77bcf86cd799439014',
+  subcategoryId: '507f1f77bcf86cd799439015',
+  title: 'Hair Styling',
+  services: [{ name: 'Cut', price: 45, durationMinutes: 60 }],
+};
+
+test('service create ends its session exactly once on every exit path', async () => {
+  const cases = [
+    ['createService', 'existing listing (409)', { existingService: buildServiceDoc() }, 409, ['start', 'abort', 'end']],
+    ['createService', 'not the owner (403)', { business: null }, 403, ['start', 'abort', 'end']],
+    ['createService', 'wrong business type (403)', { business: { _id: businessId, owner: ownerId, isActive: true, listingType: 'product' } }, 403, ['start', 'abort', 'end']],
+    ['createParentService', 'not the owner (403)', { business: null }, 403, ['start', 'abort', 'end']],
+    ['createParentService', 'created (201)', { existingService: null }, 201, ['start', 'commit', 'end']],
+  ];
+  for (const [fn, label, options, status, expected] of cases) {
+    const sessionLog = [];
+    const { controller } = loadServiceController({ ...options, sessionLog });
+    const res = mockResponse();
+    await controller[fn]({ user: { _id: ownerId }, body: { ...createBody } }, res);
+    assert.equal(res.statusCode, status, `${fn} ${label}: ${JSON.stringify(res.body)}`);
+    assert.deepEqual(sessionLog, expected, `${fn} ${label}`);
+  }
 });

@@ -76,6 +76,9 @@ const getOwnerChildServiceCount = async (ownerId, excludeServiceId = null) => {
 exports.createParentService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session; aborted there unless committed.
+  let committed = false;
 
   try {
     const {
@@ -197,7 +200,7 @@ exports.createParentService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     res.status(201).json({
       message: 'Parent service created successfully. You can now add child services.',
@@ -205,11 +208,11 @@ exports.createParentService = async (req, res) => {
     });
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
     console.error('Parent service creation failed:', err.message);
     return res.status(400).json({ error: err.message || 'Failed to create parent service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
@@ -217,6 +220,9 @@ exports.createParentService = async (req, res) => {
 exports.createService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session; aborted there unless committed.
+  let committed = false;
 
   try {
     const {
@@ -375,17 +381,17 @@ exports.createService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     return res.status(201).json(
       formatOwnerServiceResponse(service, business, 'Service created successfully.')
     );
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
-    const usedImages = [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
+    // After a commit the service exists, so its images must not be removed.
+    const usedImages = committed
+      ? []
+      : [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
     for (const image of usedImages) {
       await deleteCloudinaryFile(image).catch(() => { });
       await PendingImage.deleteOne({ url: image }).catch(() => { });
@@ -393,6 +399,9 @@ exports.createService = async (req, res) => {
 
     console.error('Service creation failed:', err.message);
     return res.status(400).json({ error: err.message || 'Failed to create service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
