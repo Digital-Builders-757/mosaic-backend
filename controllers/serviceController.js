@@ -110,6 +110,15 @@ exports.createParentService = async (req, res) => {
     if (!business)
       return res.status(403).json({ error: 'You do not own this business.' });
 
+    // Service listings belong to service businesses only; product and
+    // other businesses have their own listing types.
+    if (business.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
+    }
+
     // Subscription check
     const subscription = await Subscription.findOne({
       userId,
@@ -228,6 +237,15 @@ exports.createService = async (req, res) => {
     const business = await Business.findOne({ _id: businessId, owner: userId });
     if (!business)
       return res.status(403).json({ error: 'You do not own this business.' });
+
+    // Service listings belong to service businesses only; product and
+    // other businesses have their own listing types.
+    if (business.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
+    }
 
     const existingParentService = await Service.findOne({
       businessId,
