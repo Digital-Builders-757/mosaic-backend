@@ -131,3 +131,66 @@ test('create: publish where the only priced variant is Draft is rejected and not
   assert.equal(await Product.countDocuments({ businessId: business._id, isDeleted: { $ne: true } }), 0);
   assert.equal(await ProductVariant.countDocuments({ businessId: business._id }), 0);
 });
+
+test('create: string publish flags behave like booleans', async () => {
+  const { agent, business } = await setupVendor();
+  const res = await createProduct(agent, business, {
+    isPublished: 'true',
+    variants: [
+      { attributes: { Size: 'A' }, sku: 'SYN-CVP-SA', price: 20, stock: 2, isPublished: 'true' },
+      { attributes: { Size: 'B' }, sku: 'SYN-CVP-SB', price: 8, stock: 2, isPublished: 'false' },
+      { attributes: { Size: 'C' }, sku: 'SYN-CVP-SC', price: 30, stock: 2 },
+    ],
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  const productId = res.body.product._id;
+  assert.equal((await Product.findById(productId)).isPublished, true);
+  assert.equal((await variantBySku(productId, 'SYN-CVP-SA')).isPublished, true);
+  assert.equal((await variantBySku(productId, 'SYN-CVP-SB')).isPublished, false);
+  assert.equal((await variantBySku(productId, 'SYN-CVP-SC')).isPublished, true);
+  assert.equal(priceOf(await Product.findById(productId)), 20);
+
+  // Product-level 'false' string creates a draft (Boolean('false') used to publish).
+  const draft = await createProduct(agent, business, {
+    isPublished: 'false',
+    variants: [{ attributes: { Size: 'A' }, sku: 'SYN-CVP-SFA', price: 20, stock: 2 }],
+  });
+  assert.equal(draft.status, 201, JSON.stringify(draft.body));
+  assert.equal((await Product.findById(draft.body.product._id)).isPublished, false);
+  assert.equal((await variantBySku(draft.body.product._id, 'SYN-CVP-SFA')).isPublished, false);
+});
+
+test('create: unrecognised publish values fall back (product draft; variant follows product)', async () => {
+  const { agent, business } = await setupVendor();
+
+  // Product level: the create route's isBoolean validator already rejects
+  // non-boolean strings before the controller (pre-existing behaviour).
+  const rejected = await createProduct(agent, business, {
+    isPublished: 'yes',
+    variants: [{ attributes: { Size: 'A' }, sku: 'SYN-CVP-GX', price: 20, stock: 2 }],
+  });
+  assert.equal(rejected.status, 400, JSON.stringify(rejected.body));
+  assert.equal(await Product.countDocuments({ businessId: business._id }), 0);
+
+  // A variant-level unrecognised value on a draft create: variant stays Draft.
+  const res = await createProduct(agent, business, {
+    isPublished: false,
+    variants: [
+      { attributes: { Size: 'A' }, sku: 'SYN-CVP-GA', price: 20, stock: 2, isPublished: 'nope' },
+    ],
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  const productId = res.body.product._id;
+  assert.equal((await Product.findById(productId)).isPublished, false);
+  assert.equal((await variantBySku(productId, 'SYN-CVP-GA')).isPublished, false);
+
+  const published = await createProduct(agent, business, {
+    isPublished: true,
+    variants: [
+      { attributes: { Size: 'A' }, sku: 'SYN-CVP-GB', price: 20, stock: 2, isPublished: 'maybe' },
+    ],
+  });
+  assert.equal(published.status, 201, JSON.stringify(published.body));
+  assert.equal((await Product.findById(published.body.product._id)).isPublished, true);
+  assert.equal((await variantBySku(published.body.product._id, 'SYN-CVP-GB')).isPublished, true);
+});
