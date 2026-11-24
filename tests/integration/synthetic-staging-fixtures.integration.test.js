@@ -335,6 +335,53 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
     });
   });
 
+  it('--add-missing adds only the second Vendor A service business trio and leaves everything else untouched', async () => {
+    // Simulate staging as it is before this change: the switch-test trio is absent.
+    const added = ['subscription.vendorA.service2', 'business.vendorA.service2', 'service.consult2'];
+    await withDb(async (db) => {
+      await db.collection('subscriptions').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[0] });
+      await db.collection('businesses').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[1] });
+      await db.collection('services').deleteOne({ fixtureTag: FIXTURE_TAG, fixtureKey: added[2] });
+    });
+    const collections = ['users', 'businesses', 'subscriptions', 'services', 'foods', 'products', 'productvariants', 'vendoronboardingstage1'];
+    const snapshot = await withDb(async (db) => {
+      const out = {};
+      for (const c of collections) out[c] = await db.collection(c).find({ fixtureTag: FIXTURE_TAG }).sort({ _id: 1 }).toArray();
+      return out;
+    });
+
+    const dry = await run(['--add-missing'], { FIXTURE_PASSWORD: '' });
+    assert.equal(dry.code, 0, dry.output);
+    for (const key of added) assert.match(dry.output, new RegExp(key.replace('.', '\.')));
+
+    const { code, output } = await run(['--add-missing', '--apply'], { FIXTURE_PASSWORD: '' });
+    assert.equal(code, 0, output);
+    assert.match(output, /Applied: 3 created/);
+    assert.deepEqual(await collectionCounts({ fixtureTag: FIXTURE_TAG }), EXPECTED_COUNTS);
+
+    await withDb(async (db) => {
+      for (const [c, docs] of Object.entries(snapshot)) {
+        for (const doc of docs) {
+          assert.deepEqual(await db.collection(c).findOne({ _id: doc._id }), doc, `${c} ${doc.fixtureKey} unchanged`);
+        }
+      }
+      const vendorA = fixtureObjectId('user.vendorA');
+      const biz = await db.collection('businesses').findOne({ fixtureKey: 'business.vendorA.service2' });
+      assert.equal(biz.listingType, 'service');
+      assert.equal(String(biz.owner), String(vendorA));
+      // Oldest of Vendor A's businesses, so newest-first lists keep the existing ones first.
+      const others = await db.collection('businesses').find({ owner: vendorA, fixtureKey: { $ne: 'business.vendorA.service2' } }).toArray();
+      assert.ok(others.length === 2 && others.every((b) => b.createdAt > biz.createdAt));
+      const draft = await db.collection('services').findOne({ fixtureKey: 'service.consult2' });
+      assert.equal(draft.isPublished, false);
+      assert.deepEqual(draft.services, []);
+      // Owner-wide child-service usage is unchanged (plan limits count across businesses).
+      const children = (await db.collection('services').find({ ownerId: vendorA }).toArray())
+        .reduce((n, svc) => n + (svc.services || []).length, 0);
+      assert.equal(children, 2);
+    });
+  });
+
   it('a partial fixture set blocks re-apply until cleanup; then apply restores consistent references', async () => {
     // Simulate a partial apply: one product and its variant are missing.
     await withDb(async (db) => {

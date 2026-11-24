@@ -342,10 +342,13 @@ function buildFixtureSpec() {
       listingType: 'service',
       subscriptionKey: 'subscription.vendorA.service2',
       // Second service business for Add Service business-switch QA (#537).
+      // Dated before the other fixtures so /api/business/my (newest first)
+      // keeps listing Vendor A's existing businesses first.
       refs: (ctx) => ({
         services: [ctx.id('service.consult2')],
         serviceCategories: [ctx.id('service.category')],
-        usage: { totalServices: 1 },
+        usage: { totalServices: 0 },
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
       }),
     })
   );
@@ -429,14 +432,9 @@ function buildFixtureSpec() {
       description: 'Synthetic unpublished service draft for staging QA of switching businesses. Not a real offer.',
       price: 40,
       duration: '45 minutes',
-      services: [
-        {
-          name: 'Switch-test session',
-          description: 'Synthetic 45 minute slot',
-          durationMinutes: 45,
-          price: 40,
-        },
-      ],
+      // No offerings: child services count against the owner's plan limit
+      // across all businesses, so this draft uses none of Vendor A's slots.
+      services: [],
       categoryId: ctx.id('service.category'),
       subcategoryId: ctx.id('service.subcategory'),
       ownerId: ctx.id(ROLES.vendorA.userKey),
