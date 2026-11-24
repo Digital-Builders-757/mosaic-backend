@@ -950,7 +950,7 @@ exports.updateProduct = async (req, res) => {
       });
     }
 
-    const nextPublished =
+    let nextPublished =
       isPublished !== undefined ? isPublished : product.isPublished;
 
     // Variants are only replaced when the request sends a `variants` array
@@ -1009,16 +1009,30 @@ exports.updateProduct = async (req, res) => {
           }
         });
       }
-      const publishPreCheck = validateProductPublishState({
-        product,
-        variants: candidateVariants,
-        isPublished: true,
-      });
-      if (!publishPreCheck.ok) {
-        return res.status(400).json({
-          error: publishPreCheck.message,
-          code: publishPreCheck.code,
+
+      // Every variant the request leaves behind is Draft: unpublish the
+      // product instead of publishing an empty listing (same rule as
+      // updateVariant/deleteVariant when no published variant remains).
+      const liveCandidates = candidateVariants.filter((v) => v.isDeleted !== true);
+      const allLiveVariantsDraft =
+        hasVariantPayload &&
+        liveCandidates.length > 0 &&
+        liveCandidates.every((v) => v.isPublished !== true);
+
+      if (allLiveVariantsDraft) {
+        nextPublished = false;
+      } else {
+        const publishPreCheck = validateProductPublishState({
+          product,
+          variants: candidateVariants,
+          isPublished: true,
         });
+        if (!publishPreCheck.ok) {
+          return res.status(400).json({
+            error: publishPreCheck.message,
+            code: publishPreCheck.code,
+          });
+        }
       }
     }
 

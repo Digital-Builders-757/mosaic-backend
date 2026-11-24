@@ -168,7 +168,8 @@ test('(c) a new variant added on product update respects its own isPublished', a
   assert.equal(d.isPublished, true, 'new variant without its own flag follows the product');
 
   // On an unpublished product a new variant may still be marked Published.
-  await agent.put(`/api/product/${productId}`).send({ isPublished: false });
+  const unpublished = await agent.put(`/api/product/${productId}`).send({ isPublished: false });
+  assert.equal(unpublished.status, 200, JSON.stringify(unpublished.body));
   const draftProduct = await agent.put(`/api/product/${productId}`).send({
     variants: [
       { _id: a._id, attributes: { Size: 'A' } },
@@ -200,9 +201,13 @@ test('(d) derived product price and publication stay consistent with per-variant
   assert.equal(stored.isPublished, true, 'product stays published while a variant is published');
   // #365: product.price is summarised from non-deleted variants via the shared
   // helper; the stored value must match a fresh summary of what is persisted.
+  // Draft variants still count toward product.price ON PURPOSE: that is the
+  // pre-existing #365 rule, unchanged by this fix (changing it is follow-up
+  // W2). So the drafted $10 variant B still sets the price.
   const persisted = await ProductVariant.find({ productId, isDeleted: { $ne: true } });
   const expected = summarizeVariantPrices(persisted);
   assert.equal(stored.price.toString(), expected.price.toString());
+  assert.equal(priceOf(stored), 10);
   assert.equal(Number(res.body.product.price.$numberDecimal), priceOf(stored));
 
   // Parity: the update-variant endpoint produces the same variant state and
@@ -233,4 +238,68 @@ test('(d) derived product price and publication stay consistent with per-variant
     summarizeVariantPrices(persistedAfter).price.toString()
   );
   assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+  // Draft B ($8) still sets product.price under the #365 rule (see above).
+  assert.equal(priceOf(afterPriceChange), 8);
+});
+
+test('(e) every variant Draft with product isPublished:true unpublishes the product', async () => {
+  const { agent, business } = await setupVendor();
+  const { productId, a, b } = await createPublishedProduct(agent, business);
+
+  // Same rule as update-variant/delete-variant: no published variant left
+  // means the product is unpublished, not rejected and not left published.
+  const res = await agent.put(`/api/product/${productId}`).send({
+    isPublished: true,
+    variants: [
+      { _id: a._id, attributes: { Size: 'A' }, isPublished: false },
+      { _id: b._id, attributes: { Size: 'B' }, isPublished: false },
+    ],
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.product.isPublished, false);
+  assert.equal((await Product.findById(productId)).isPublished, false);
+  assert.equal((await ProductVariant.findById(a._id)).isPublished, false);
+  assert.equal((await ProductVariant.findById(b._id)).isPublished, false);
+  assert.equal(await ProductVariant.countDocuments({ productId }), 2);
+});
+
+test('(f) publishing with only an unpriced variant published (priced one Draft) is rejected before any write', async () => {
+  const { agent, business } = await setupVendor();
+  const created = await agent.post('/api/product').send({
+    title: 'Synthetic Unpriced Publish Product',
+    description: 'Synthetic product: only the priced variant is Draft',
+    categoryId: new mongoose.Types.ObjectId().toString(),
+    subcategoryId: new mongoose.Types.ObjectId().toString(),
+    businessId: business._id.toString(),
+    coverImage: 'https://example.test/variant-publish-unpriced.webp',
+    isPublished: false,
+    variants: [
+      { attributes: { Size: 'Z' }, sku: 'SYN-VP-ZERO', price: 0, stock: 1 },
+      { attributes: { Size: 'P' }, sku: 'SYN-VP-PRICED', price: 15, stock: 1 },
+    ],
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const productId = created.body.product._id;
+  const zero = created.body.variants.find((v) => v.sku.endsWith('SYN-VP-ZERO'));
+  const priced = created.body.variants.find((v) => v.sku.endsWith('SYN-VP-PRICED'));
+  const before = await Product.findById(productId);
+
+  const res = await agent.put(`/api/product/${productId}`).send({
+    title: 'Renamed before rejection',
+    isPublished: true,
+    variants: [
+      { _id: zero._id, attributes: { Size: 'Z' }, isPublished: true },
+      { _id: priced._id, attributes: { Size: 'P' }, isPublished: false },
+    ],
+  });
+  assert.equal(res.status, 400, JSON.stringify(res.body));
+  assert.equal(res.body.code, 'LISTING_PRICE_REQUIRED');
+
+  const after = await Product.findById(productId);
+  assert.equal(after.title, before.title);
+  assert.equal(after.isPublished, false);
+  assert.equal(String(after.price), String(before.price));
+  assert.equal(await ProductVariant.countDocuments({ productId }), 2);
+  assert.equal((await ProductVariant.findById(zero._id)).isPublished, false);
+  assert.equal((await ProductVariant.findById(priced._id)).isPublished, false);
 });
