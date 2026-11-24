@@ -245,6 +245,17 @@ const normalizeVariantPayload = (variant, options = {}) => {
   };
 };
 
+// Publication state for one variant in a product update. A boolean
+// `isPublished` on the variant itself (the editor's per-variant Published /
+// Draft choice) wins; otherwise the product-level value applies, and when that
+// is absent too the variant keeps `fallback` (its stored state, or false for a
+// new variant).
+const resolveVariantPublished = (variant, productIsPublished, fallback) => {
+  if (typeof variant?.isPublished === 'boolean') return variant.isPublished;
+  if (productIsPublished !== undefined) return productIsPublished;
+  return fallback;
+};
+
 const toDecimal128 = (value) => Decimal128.fromString(String(value));
 
 const toStockNumber = (value) => {
@@ -939,7 +950,7 @@ exports.updateProduct = async (req, res) => {
       });
     }
 
-    const nextPublished =
+    let nextPublished =
       isPublished !== undefined ? isPublished : product.isPublished;
 
     // Variants are only replaced when the request sends a `variants` array
@@ -985,7 +996,7 @@ exports.updateProduct = async (req, res) => {
             candidateVariants.push({
               price: normalizedVariant.hasPrice ? normalizedVariant.price : existingVariant.price,
               salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : existingVariant.salePrice,
-              isPublished: isPublished !== undefined ? isPublished : existingVariant.isPublished,
+              isPublished: resolveVariantPublished(variant, isPublished, existingVariant.isPublished),
               // The loop below keeps isDeleted as stored; the publish rule ignores deleted variants.
               isDeleted: existingVariant.isDeleted,
             });
@@ -993,21 +1004,35 @@ exports.updateProduct = async (req, res) => {
             candidateVariants.push({
               price: normalizedVariant.price,
               salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : null,
-              isPublished: isPublished || false,
+              isPublished: resolveVariantPublished(variant, isPublished || false, false),
             });
           }
         });
       }
-      const publishPreCheck = validateProductPublishState({
-        product,
-        variants: candidateVariants,
-        isPublished: true,
-      });
-      if (!publishPreCheck.ok) {
-        return res.status(400).json({
-          error: publishPreCheck.message,
-          code: publishPreCheck.code,
+
+      // Every variant the request leaves behind is Draft: unpublish the
+      // product instead of publishing an empty listing (same rule as
+      // updateVariant/deleteVariant when no published variant remains).
+      const liveCandidates = candidateVariants.filter((v) => v.isDeleted !== true);
+      const allLiveVariantsDraft =
+        hasVariantPayload &&
+        liveCandidates.length > 0 &&
+        liveCandidates.every((v) => v.isPublished !== true);
+
+      if (allLiveVariantsDraft) {
+        nextPublished = false;
+      } else {
+        const publishPreCheck = validateProductPublishState({
+          product,
+          variants: candidateVariants,
+          isPublished: true,
         });
+        if (!publishPreCheck.ok) {
+          return res.status(400).json({
+            error: publishPreCheck.message,
+            code: publishPreCheck.code,
+          });
+        }
       }
     }
 
@@ -1080,8 +1105,11 @@ exports.updateProduct = async (req, res) => {
               existingVariant.shipping
             );
             existingVariant.images = variant.images || [];
-            existingVariant.isPublished =
-              isPublished !== undefined ? isPublished : existingVariant.isPublished;
+            existingVariant.isPublished = resolveVariantPublished(
+              variant,
+              isPublished,
+              existingVariant.isPublished
+            );
 
             await existingVariant.save();
             savedVariants.push(existingVariant);
@@ -1118,7 +1146,7 @@ exports.updateProduct = async (req, res) => {
             stock: normalizedVariant.stock,
             shipping: normalizeVariantShipping(variant.shipping),
             images: variant.images || [],
-            isPublished: isPublished || false
+            isPublished: resolveVariantPublished(variant, isPublished || false, false)
           });
 
           await newVariant.save();
