@@ -77,7 +77,8 @@ exports.createParentService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
   // Ended in `finally` so early returns (ownership, type, validation, limits)
-  // never leak the session; aborted there unless committed.
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
   let committed = false;
 
   try {
@@ -209,6 +210,10 @@ exports.createParentService = async (req, res) => {
 
   } catch (err) {
     console.error('Parent service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create parent service' });
   } finally {
     if (!committed) await session.abortTransaction().catch(() => {});
@@ -221,7 +226,8 @@ exports.createService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
   // Ended in `finally` so early returns (ownership, type, validation, limits)
-  // never leak the session; aborted there unless committed.
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
   let committed = false;
 
   try {
@@ -398,6 +404,10 @@ exports.createService = async (req, res) => {
     }
 
     console.error('Service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create service' });
   } finally {
     if (!committed) await session.abortTransaction().catch(() => {});
