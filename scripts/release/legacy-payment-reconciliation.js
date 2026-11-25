@@ -450,7 +450,8 @@ function resolveTestModeAttestation({ requireLive, deploymentStripeMode, expecte
     }
     return null; // explicit "live": the unchanged live-only policy
   }
-  if (!accountGiven || !STRIPE_ACCOUNT_ID.test(String(expectedStripeAccount))) {
+  if (!accountGiven || typeof expectedStripeAccount !== 'string'
+      || !STRIPE_ACCOUNT_ID.test(expectedStripeAccount)) {
     throw new Error('--deployment-stripe-mode test requires --expected-stripe-account acct_<id>');
   }
   return { deploymentStripeMode: 'test', expectedStripeAccount };
@@ -459,6 +460,12 @@ function resolveTestModeAttestation({ requireLive, deploymentStripeMode, expecte
 function digestRecord(record, { requireLive = true, deploymentStripeMode, expectedStripeAccount } = {}) {
   const attestation = resolveTestModeAttestation({ requireLive, deploymentStripeMode, expectedStripeAccount });
   const problems = validateReviewedRecord(record);
+  // Only digest itself may add deploymentAttestation, on every path (live,
+  // rehearsal, attestation); a record carrying one is refused outright.
+  if (record && typeof record === 'object'
+      && Object.prototype.hasOwnProperty.call(record, 'deploymentAttestation')) {
+    problems.push('Record must not contain deploymentAttestation; digest adds it');
+  }
   if (!attestation) {
     if (requireLive && record?.stripe?.livemode !== true) {
       problems.push('Only a live-mode record may produce the production digest (use --allow-test-mode for rehearsal)');
@@ -478,9 +485,6 @@ function digestRecord(record, { requireLive = true, deploymentStripeMode, expect
       if (entry.livemode !== false) {
         problems.push(`${entry.paymentIntentId} is not a test-mode entry (livemode must be false)`);
       }
-    }
-    if (record && Object.prototype.hasOwnProperty.call(record, 'deploymentAttestation')) {
-      problems.push('Record must not contain deploymentAttestation; digest adds it');
     }
     problems.push(...stripeModeHistoryProblems(record?.review?.stripeModeHistory, attestation.expectedStripeAccount));
   }

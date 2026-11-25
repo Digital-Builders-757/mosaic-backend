@@ -344,6 +344,12 @@ entries. `sha256sum record.canonical.json` still equals the printed digest;
 recomputing requires the same two flags. If live keys are ever configured on
 Production, this attestation no longer applies: reconcile live mode as well.
 
+Recompute from `record.json`, not `record.canonical.json`: `digest` refuses
+any record that already contains `deploymentAttestation` (on every path), and
+the canonical file does. To verify a canonical file on its own, `sha256sum`
+it, or remove its `deploymentAttestation` key and re-run `digest` with the
+`--deployment-stripe-mode` / `--expected-stripe-account` values that key named.
+
 ## What this procedure never does
 
 - No Stripe writes (no cancel, refund, capture, update) and no SDK import; the

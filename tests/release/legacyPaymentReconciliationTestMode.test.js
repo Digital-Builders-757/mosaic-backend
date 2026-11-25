@@ -125,6 +125,34 @@ test('live record is refused under --deployment-stripe-mode test', () => {
   assert.throws(() => digestRecord(missingEntryMode, TEST_FLAGS), /pi_2 is not a test-mode entry/);
 });
 
+test('a record already carrying deploymentAttestation is refused on every digest path', () => {
+  const fake = { deploymentStripeMode: 'test', expectedStripeAccount: ACCOUNT };
+  const live = liveRecord();
+  live.deploymentAttestation = fake;
+  assert.throws(() => digestRecord(live), /must not contain deploymentAttestation/);
+  assert.throws(() => digestRecord(live, { deploymentStripeMode: 'live' }), /must not contain deploymentAttestation/);
+  const rehearsal = testRecord();
+  rehearsal.deploymentAttestation = fake;
+  assert.throws(() => digestRecord(rehearsal, { requireLive: false }), /must not contain deploymentAttestation/);
+  // A canonical output (which contains the key) cannot be fed back as a record.
+  const canonicalAsRecord = JSON.parse(digestRecord(testRecord(), TEST_FLAGS).canonical);
+  assert.throws(() => digestRecord(canonicalAsRecord, TEST_FLAGS), /must not contain deploymentAttestation/);
+  // Removing the key and re-running with the flags it names reproduces the digest.
+  const { deploymentAttestation, ...stripped } = canonicalAsRecord;
+  assert.equal(digestRecord(stripped, {
+    deploymentStripeMode: deploymentAttestation.deploymentStripeMode,
+    expectedStripeAccount: deploymentAttestation.expectedStripeAccount,
+  }).sha256, digestRecord(testRecord(), TEST_FLAGS).sha256);
+});
+
+test('a non-string expected account is a hard error', () => {
+  const stringish = { toString: () => ACCOUNT };
+  for (const expectedStripeAccount of [stringish, [ACCOUNT], null, 42]) {
+    assert.throws(() => digestRecord(testRecord(), { deploymentStripeMode: 'test', expectedStripeAccount }),
+      /requires --expected-stripe-account acct_<id>/);
+  }
+});
+
 test('account mismatches and unverified accounts are refused', () => {
   assert.throws(() => digestRecord(testRecord(), { ...TEST_FLAGS, expectedStripeAccount: 'acct_other' }),
     /does not equal --expected-stripe-account acct_other/);
