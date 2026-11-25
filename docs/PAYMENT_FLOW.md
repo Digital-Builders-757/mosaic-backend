@@ -86,7 +86,7 @@ Full list: [`.env.example`](../.env.example), [production-env-checklist.md](prod
 
 **Retrieve payment:** `GET /api/orders/retrieve-intent/:id` → [`stripePaymentController.retrieveIntent`](../controllers/stripePaymentController.js)
 
-**Legacy PI path:** `POST /api/payments/create-payment-intent` → [`paymentController.createPaymentIntent`](../controllers/paymentController.js) — amount derived from order total (client amount must match).
+**Legacy PI path (retired):** `POST /api/payments/create-payment-intent` was removed on 2026-11-24 and now returns 404. **Retired 2026-11-24** (route, router and controller removed; returns 404). Reconcile historical legacy intents per [docs/release/LEGACY_PAYMENT_RECONCILIATION_PLAN.md](release/LEGACY_PAYMENT_RECONCILIATION_PLAN.md).
 
 **Refunds:** `orderController` refund handlers call `stripe.refunds.create` (admin/vendor flows).
 
@@ -247,7 +247,7 @@ Webhook tests in `tests/stripe/`. Vendor payment tests in `tests/vendor/`.
 |--------|------|------|---------|
 | POST | `/api/orders/initiate` | Customer | Create order + Connect PI |
 | GET | `/api/orders/retrieve-intent/:id` | Varies | PI + orders lookup |
-| POST | `/api/payments/create-payment-intent` | — | Legacy PI from orderId |
+| POST | `/api/payments/create-payment-intent` | — | **Retired** (404); historical legacy PIs are reconciled read-only |
 | POST | `/api/vendor-onboarding/stage1/create-payment` | Vendor | Verification fee PI |
 | POST | `/api/subscriptions/create` | User | Subscription PI |
 | POST | `/api/stripe/create-checkout-session` | Business owner | Draft checkout |

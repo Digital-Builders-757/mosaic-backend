@@ -207,7 +207,7 @@ $code = Get-StatusCode "$Base/admin/api/products"
 if ($code -eq 401) { Write-SmokePass "P3.1 GET /admin/api/products unauth ($code)" } else { Write-SmokeFail "P3.1 GET /admin/api/products ($code, expected 401)" }
 
 $code = Get-StatusCode -Uri "$Base/api/payments/create-payment-intent" -Method POST -Body '{}'
-if ($code -eq 401) { Write-SmokePass "P4.3 POST /api/payments/create-payment-intent unauth ($code)" } else { Write-SmokeFail "P4.3 POST /api/payments/create-payment-intent ($code, expected 401)" }
+if ($code -eq 404 -or $code -eq 405) { Write-SmokePass "P4.3 POST /api/payments/create-payment-intent retired ($code)" } else { Write-SmokeFail "P4.3 POST /api/payments/create-payment-intent ($code, expected retired 404/405)" }
 
 $code = Get-StatusCode "$Base/stripe/account-balance"
 if ($code -eq 401) { Write-SmokePass "P5.0 GET /stripe/account-balance unauth ($code)" } else { Write-SmokeFail "P5.0 GET /stripe/account-balance ($code, expected 401)" }

@@ -148,7 +148,7 @@ code=$(http_code "$BASE/admin/api/products")
 if [ "$code" = "401" ]; then pass "P3.1 GET /admin/api/products unauth ($code)"; else fail "P3.1 GET /admin/api/products ($code, expected 401)"; fi
 
 code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Content-Type: application/json" "$BASE/api/payments/create-payment-intent")
-if [ "$code" = "401" ]; then pass "P4.3 POST /api/payments/create-payment-intent unauth ($code)"; else fail "P4.3 POST /api/payments/create-payment-intent ($code, expected 401)"; fi
+if [ "$code" = "404" ] || [ "$code" = "405" ]; then pass "P4.3 POST /api/payments/create-payment-intent retired ($code)"; else fail "P4.3 POST /api/payments/create-payment-intent ($code, expected retired 404/405)"; fi
 
 code=$(http_code "$BASE/stripe/account-balance")
 if [ "$code" = "401" ]; then pass "P5.0 GET /stripe/account-balance unauth ($code)"; else fail "P5.0 GET /stripe/account-balance ($code, expected 401)"; fi
