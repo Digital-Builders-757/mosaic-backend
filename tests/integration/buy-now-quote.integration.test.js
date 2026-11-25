@@ -147,3 +147,44 @@ test('quote rate limit returns RATE_LIMITED and leaves initiate outside the limi
   assert.equal(response.body.code, 'RATE_LIMITED');
   assert.equal((await agent.post('/api/orders/initiate').send({})).status, 401);
 });
+
+test('initiate rejects hidden products and variants like the quote, before any side effect', async () => {
+  const Order = require('../../models/Order');
+  const vendorAgent = createAgent(getApp());
+  const vendor = await registerAndVerify(vendorAgent, { role: 'business_owner' });
+  const owner = await User.findOne({ email: vendor.email });
+  const business = await seedApprovedBusiness(owner, { chargesEnabled: true, capabilities: { transfers: 'active' } });
+  const product = await seedPublishedProduct(business, owner);
+  const variant = await ProductVariant.create({ productId: product._id, businessId: business._id,
+    ownerId: owner._id, isPublished: true, attributes: { size: 'M' }, sku: 'HIDDEN', price: 20, stock: 100 });
+  const agent = createAgent(getApp());
+  const buyer = await registerAndVerify(agent, { role: 'customer' });
+  await login(agent, buyer.email, buyer.password);
+  const body = { items: [{ productId: String(product._id), variantId: String(variant._id), size: 'M', quantity: 1, price: 20 }],
+    shippingAddress: { fullName: 'Buyer', phone: '1234567890', addressLine1: '1 Main St', state: 'GA' } };
+  for (const [document, field, value] of [
+    [product, 'isPublished', false], [product, 'isActive', false],
+    [product, 'isDeleted', true], [variant, 'isPublished', false], [variant, 'isDeleted', true],
+  ]) {
+    const previous = document[field];
+    document[field] = value; await document.save();
+    const before = await snapshot();
+    // Any Stripe call (accounts.retrieve / paymentIntents.create) would throw
+    // and turn the response into a non-404, so 404 proves Stripe was not reached.
+    setStripeShouldFail(true);
+    const hidden = await agent.post('/api/orders/initiate').send(body);
+    setStripeShouldFail(false);
+    const label = `${document === product ? 'product' : 'variant'}.${field}=${value}`;
+    assert.equal(hidden.status, 404, label + ' ' + JSON.stringify(hidden.body));
+    assert.deepEqual(hidden.body, { success: false, message: 'Product or variant not found' }, label);
+    assert.equal(await snapshot(), before, label + ': no order, stock or other document change');
+    assert.equal(await Order.countDocuments(), 0, label);
+    assert.equal((await ProductVariant.findById(variant._id)).stock, 100, label);
+    // Quote-side 404 for the same flags is asserted in the eligibility test
+    // above; not re-called here because the quote limiter is per-process.
+    document[field] = previous; await document.save();
+  }
+  const ok = await agent.post('/api/orders/initiate').send(body);
+  assert.equal(ok.status, 201, JSON.stringify(ok.body));
+  assert.equal(await Order.countDocuments(), 1);
+});
