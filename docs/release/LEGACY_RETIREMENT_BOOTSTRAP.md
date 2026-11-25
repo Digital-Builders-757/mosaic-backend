@@ -54,7 +54,10 @@ checks only run when `release_mode == legacy-retirement-bootstrap`.
 2. Complete the read-only reconciliation in
    [`LEGACY_PAYMENT_RECONCILIATION_PLAN.md`](LEGACY_PAYMENT_RECONCILIATION_PLAN.md)
    and have the release owner set `LEGACY_PAYMENT_RECONCILIATION_SHA256`.
-   Leave `LEGACY_PAYMENT_RETIREMENT_SHA` unset.
+   Leave `LEGACY_PAYMENT_RETIREMENT_SHA` unset. Production on Stripe test keys
+   uses the
+   [test-mode production attestation](LEGACY_PAYMENT_RECONCILIATION_PLAN.md#production-in-stripe-test-mode)
+   (`digest --deployment-stripe-mode test --expected-stripe-account acct_…`).
 3. Dispatch `Mosaic Production Release` with `mode=legacy-retirement-bootstrap`,
    `release_sha=<exact main tip>`, and the bootstrap phrase as `confirmation`.
 4. Review the preflight evidence (`legacy-retirement-bootstrap.json`,

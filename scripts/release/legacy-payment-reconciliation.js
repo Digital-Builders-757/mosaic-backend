@@ -19,6 +19,12 @@
 // - The digest is SHA-256 over a deterministic canonical JSON encoding of the
 //   reviewed record (see canonicalize()). It is the value an operator copies
 //   into the LEGACY_PAYMENT_RECONCILIATION_SHA256 repository variable.
+// - By default only a live-mode record is digested. A production deployment
+//   that has only ever used Stripe test mode may instead attest with
+//   `digest --deployment-stripe-mode test --expected-stripe-account acct_…`,
+//   which additionally requires a reviewer-filled review.stripeModeHistory
+//   block and binds mode + account into the hashed bytes. --allow-test-mode is
+//   rehearsal-only and cannot be combined with those flags.
 //
 // See docs/release/LEGACY_PAYMENT_RECONCILIATION_PLAN.md for the procedure.
 
@@ -50,6 +56,9 @@ const SETTLED_RESOLUTIONS = Object.freeze([
 const ORDER_ID = /^[a-f0-9]{24}$/i;
 const PAYMENT_INTENT_ID = /^pi_[A-Za-z0-9]+$/;
 const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9]+$/;
+// Values accepted by `digest --deployment-stripe-mode`. "live" is the default
+// live-only policy; "test" enables the production test-mode attestation.
+const DEPLOYMENT_STRIPE_MODES = Object.freeze(['live', 'test']);
 
 function canonicalize(value) {
   if (value === null) return 'null';
@@ -370,17 +379,120 @@ function validateReviewedRecord(record) {
   return problems;
 }
 
-function digestRecord(record, { requireLive = true } = {}) {
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function isIsoTimestamp(value) {
+  return typeof value === 'string' && ISO_TIMESTAMP.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+// Problems with the reviewer-filled review.stripeModeHistory block that a
+// production test-mode attestation requires. A current sk_test_/rk_test_ key
+// does not prove live payments were never configured, so a human must attest
+// the deployment's Stripe mode history with checkable references.
+function stripeModeHistoryProblems(history, expectedStripeAccount) {
+  const prefix = 'review.stripeModeHistory';
+  if (!history || typeof history !== 'object' || Array.isArray(history)) {
+    return [`${prefix} is required for a production test-mode attestation`];
+  }
+  const problems = [];
+  if (history.deploymentMode !== 'test') {
+    problems.push(`${prefix}.deploymentMode must be exactly "test"`);
+  }
+  if (history.account !== expectedStripeAccount) {
+    problems.push(`${prefix}.account must equal --expected-stripe-account ${expectedStripeAccount}`);
+  }
+  if (history.livePaymentsEverConfigured !== false) {
+    problems.push(`${prefix}.livePaymentsEverConfigured must be exactly false`);
+  }
+  if (!isNonEmptyString(history.verifiedBy)) {
+    problems.push(`${prefix}.verifiedBy must name the verifying reviewer (GitHub handle)`);
+  }
+  if (!isIsoTimestamp(history.verifiedAt)) {
+    problems.push(`${prefix}.verifiedAt must be an ISO-8601 timestamp`);
+  }
+  if (!Array.isArray(history.evidence) || history.evidence.length < 1) {
+    problems.push(`${prefix}.evidence must be a non-empty array of { source, reference, checkedAt }`);
+  } else {
+    history.evidence.forEach((item, index) => {
+      const at = `${prefix}.evidence[${index}]`;
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        problems.push(`${at} must be an object`);
+        return;
+      }
+      if (!isNonEmptyString(item.source)) problems.push(`${at}.source must be a non-empty string`);
+      if (!isNonEmptyString(item.reference)) problems.push(`${at}.reference must be a non-empty string`);
+      if (!isIsoTimestamp(item.checkedAt)) problems.push(`${at}.checkedAt must be an ISO-8601 timestamp`);
+    });
+  }
+  return problems;
+}
+
+// Resolves the digest policy from options. Fails closed: unknown modes and
+// contradictory or partial flag combinations are hard errors, never a silent
+// fallback. Returns null for the default live-only policy.
+function resolveTestModeAttestation({ requireLive, deploymentStripeMode, expectedStripeAccount }) {
+  const modeGiven = deploymentStripeMode !== undefined;
+  const accountGiven = expectedStripeAccount !== undefined;
+  if (!modeGiven && !accountGiven) return null;
+  if (requireLive === false) {
+    throw new Error('--allow-test-mode (rehearsal) cannot be combined with --deployment-stripe-mode / --expected-stripe-account');
+  }
+  if (modeGiven && !DEPLOYMENT_STRIPE_MODES.includes(deploymentStripeMode)) {
+    throw new Error(`--deployment-stripe-mode must be exactly one of ${DEPLOYMENT_STRIPE_MODES.join(', ')}`);
+  }
+  if (deploymentStripeMode !== 'test') {
+    if (accountGiven) {
+      throw new Error('--expected-stripe-account is only valid with --deployment-stripe-mode test');
+    }
+    return null; // explicit "live": the unchanged live-only policy
+  }
+  if (!accountGiven || !STRIPE_ACCOUNT_ID.test(String(expectedStripeAccount))) {
+    throw new Error('--deployment-stripe-mode test requires --expected-stripe-account acct_<id>');
+  }
+  return { deploymentStripeMode: 'test', expectedStripeAccount };
+}
+
+function digestRecord(record, { requireLive = true, deploymentStripeMode, expectedStripeAccount } = {}) {
+  const attestation = resolveTestModeAttestation({ requireLive, deploymentStripeMode, expectedStripeAccount });
   const problems = validateReviewedRecord(record);
-  if (requireLive && record?.stripe?.livemode !== true) {
-    problems.push('Only a live-mode record may produce the production digest (use --allow-test-mode for rehearsal)');
+  if (!attestation) {
+    if (requireLive && record?.stripe?.livemode !== true) {
+      problems.push('Only a live-mode record may produce the production digest (use --allow-test-mode for rehearsal)');
+    }
+  } else {
+    const stripe = record?.stripe || {};
+    if (stripe.livemode !== false || stripe.accountMode !== 'test') {
+      problems.push('Stripe mode mismatch: --deployment-stripe-mode test requires a test-mode record (stripe.livemode false, stripe.accountMode test)');
+    }
+    if (stripe.accountId !== attestation.expectedStripeAccount) {
+      problems.push(`stripe.accountId ${stripe.accountId} does not equal --expected-stripe-account ${attestation.expectedStripeAccount}`);
+    }
+    if (stripe.accountVerifiedBy !== 'GET /v1/account') {
+      problems.push('stripe.accountVerifiedBy must be "GET /v1/account" (account id verified at export)');
+    }
+    for (const entry of Array.isArray(record?.entries) ? record.entries : []) {
+      if (entry.livemode !== false) {
+        problems.push(`${entry.paymentIntentId} is not a test-mode entry (livemode must be false)`);
+      }
+    }
+    if (record && Object.prototype.hasOwnProperty.call(record, 'deploymentAttestation')) {
+      problems.push('Record must not contain deploymentAttestation; digest adds it');
+    }
+    problems.push(...stripeModeHistoryProblems(record?.review?.stripeModeHistory, attestation.expectedStripeAccount));
   }
   if (problems.length) {
     const error = new Error(`Record is not approvable:\n- ${problems.join('\n- ')}`);
     error.problems = problems;
     throw error;
   }
-  const canonical = canonicalize(record);
+  // Live path: the record itself is hashed (unchanged). Test-mode attestation:
+  // the deployment mode and expected account are bound into the hashed bytes,
+  // so a test-mode digest can never equal a live digest of the same entries.
+  const canonical = canonicalize(attestation ? { ...record, deploymentAttestation: attestation } : record);
   return { canonical, sha256: sha256Hex(canonical) };
 }
 
@@ -390,6 +502,7 @@ function parseCli(argv) {
   for (let index = 0; index < rest.length; index += 1) {
     const name = rest[index];
     if (!name.startsWith('--')) throw new Error(`Unexpected argument ${name}`);
+    if (Object.prototype.hasOwnProperty.call(options, name)) throw new Error(`${name} given more than once`);
     if (name === '--allow-test-mode') {
       options[name] = true;
       continue;
@@ -445,7 +558,11 @@ async function main(argv = process.argv.slice(2), env = process.env, dependencie
   }
   if (command === 'digest') {
     const { json } = readJson(need('--record'));
-    const result = digestRecord(json, { requireLive: !options['--allow-test-mode'] });
+    const result = digestRecord(json, {
+      requireLive: !options['--allow-test-mode'],
+      deploymentStripeMode: options['--deployment-stripe-mode'],
+      expectedStripeAccount: options['--expected-stripe-account'],
+    });
     if (options['--canonical-output']) writeFile(options['--canonical-output'], result.canonical);
     console.log(result.sha256);
     return result;
@@ -464,6 +581,7 @@ module.exports = {
   ALLOWED_GET_PATHS,
   APPROVED_DECISION,
   DEFAULT_CREATED_GTE,
+  DEPLOYMENT_STRIPE_MODES,
   PAYABLE_STATUSES,
   SETTLED_RESOLUTIONS,
   buildDraftRecord,
