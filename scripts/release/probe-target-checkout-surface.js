@@ -72,7 +72,7 @@ function hasLegacyPostRoute(app) {
 }
 
 async function verifyStatuses(requestStatus, clock, releaseMode = 'release') {
-  if (!['release', 'rollback', 'focused-baseline'].includes(releaseMode)) {
+  if (!['release', 'rollback', 'focused-baseline', 'legacy-retirement-bootstrap'].includes(releaseMode)) {
     throw new Error('Unsupported release mode');
   }
   const canonical = [];
@@ -124,7 +124,7 @@ function safeProbeEnvironment(env = process.env) {
 
 async function probeTarget(root, dependencies = {}) {
   const releaseMode = dependencies.releaseMode || 'release';
-  if (!['release', 'rollback', 'focused-baseline'].includes(releaseMode)) {
+  if (!['release', 'rollback', 'focused-baseline', 'legacy-retirement-bootstrap'].includes(releaseMode)) {
     throw new Error('Unsupported release mode');
   }
   safeProbeEnvironment(dependencies.env || process.env);
@@ -133,6 +133,9 @@ async function probeTarget(root, dependencies = {}) {
   if (typeof app !== 'function') throw new Error('Exact target app export is not an HTTP handler');
   if (!hasCanonicalPostRoute(app)) {
     throw new Error('Exact target route stack lacks canonical POST /api/orders/initiate');
+  }
+  if (releaseMode === 'legacy-retirement-bootstrap' && hasLegacyPostRoute(app)) {
+    throw new Error('Legacy retirement bootstrap target still mounts POST /api/payments/create-payment-intent');
   }
   if (releaseMode === 'focused-baseline' && !hasLegacyPostRoute(app)) {
     throw new Error('Exact target route stack lacks approved legacy POST /api/payments/create-payment-intent');
