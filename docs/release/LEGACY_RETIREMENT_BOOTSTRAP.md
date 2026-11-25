@@ -81,10 +81,9 @@ closed, do not approve; that is a product decision, not a workflow option.
   ancestor of `T` (so `T = R` or any later main commit), `T` is not already
   live, and `T`'s tree/route table has no legacy route. Rolling back to
   anything older than `R` is permanently refused.
-- Existing limitation (not changed here): the approval job passes
-  `--release-mode "$RELEASE_MODE"` explicitly to `manage-checkout-gate.js
-  verify` and `verify-checkout-gate.sh`, both of which reject an explicit
-  `rollback` mode. Review that before relying on workflow rollback.
+- Workflow rollback passes `--release-mode "$RELEASE_MODE"` explicitly;
+  `manage-checkout-gate.js verify` and `verify-checkout-gate.sh` accept an
+  explicit `rollback` and map it to the canonical release gate (#391).
 
 ## Failure handling
 

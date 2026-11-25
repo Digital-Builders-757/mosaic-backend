@@ -67,13 +67,18 @@ if [ "$EXPECTED_STATE" != "active" ] && [ "$EXPECTED_STATE" != "inactive" ]; the
   echo "--state must be active or inactive" >&2
   exit 2
 fi
-# An inherited rollback uses the existing canonical gate check. Rollback was
-# never an explicit verifier mode, so keep that interface unchanged.
 if [ "$RELEASE_MODE" != "release" ] && [ "$RELEASE_MODE" != "focused-baseline" ] \
-  && [ "$RELEASE_MODE" != "legacy-retirement-bootstrap" ] \
-  && { [ "$RELEASE_MODE" != "rollback" ] || [ "$RELEASE_MODE_FLAG_SET" = true ]; }; then
-  echo "--release-mode must be release or focused-baseline (or legacy-retirement-bootstrap)" >&2
+  && [ "$RELEASE_MODE" != "rollback" ] \
+  && [ "$RELEASE_MODE" != "legacy-retirement-bootstrap" ]; then
+  echo "--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap" >&2
   exit 2
+fi
+# Break-glass rollback uses the canonical (release) gate path whether the mode
+# is inherited from RELEASE_MODE or passed explicitly with --release-mode, which
+# is what the production workflow does. The flag/environment agreement check
+# above still applies, so this cannot downgrade a focused-baseline gate.
+if [ "$RELEASE_MODE" = "rollback" ]; then
+  RELEASE_MODE="release"
 fi
 
 if [ "$#" -eq 0 ] && [ -n "${PRODUCTION_API_URL:-}" ]; then
@@ -81,7 +86,7 @@ if [ "$#" -eq 0 ] && [ -n "${PRODUCTION_API_URL:-}" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  echo "Usage: verify-checkout-gate.sh [--state active|inactive] [--release-mode release|focused-baseline|legacy-retirement-bootstrap] BASE_URL [BASE_URL ...]" >&2
+  echo "Usage: verify-checkout-gate.sh [--state active|inactive] [--release-mode release|rollback|focused-baseline|legacy-retirement-bootstrap] BASE_URL [BASE_URL ...]" >&2
   exit 2
 fi
 
