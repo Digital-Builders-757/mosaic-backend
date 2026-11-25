@@ -699,7 +699,7 @@ test('focused-baseline public verifier checks both routes on HTTP and HTTPS', ()
   assert.doesNotMatch(normal, /create-payment-intent/);
   assert.throws(
     () => runGateVerifierFixture({ releaseMode: 'unsupported' }),
-    (error) => error.status === 2 && /--release-mode must be release, rollback, or focused-baseline/
+    (error) => error.status === 2 && /--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/
       .test(String(error.stderr))
   );
 });
@@ -752,7 +752,7 @@ test('gate verifier binds inherited release mode and rejects flag/environment di
   assert.throws(
     () => runGateVerifierFixture({ inheritedReleaseMode: '' }),
     (error) => error.status === 2
-      && /--release-mode must be release, rollback, or focused-baseline/.test(String(error.stderr)),
+      && /--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/.test(String(error.stderr)),
   );
   assert.throws(
     () => runGateVerifierFixture({ releaseMode: '', inheritedReleaseMode: 'focused-baseline' }),

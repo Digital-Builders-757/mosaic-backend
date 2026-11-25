@@ -5,6 +5,7 @@ const path = require('node:path');
 const Module = require('node:module');
 
 const paymentRoutesPath = path.resolve(__dirname, '../../routes/paymentRoutes.js');
+const appPath = path.resolve(__dirname, '../../app.js');
 const stripeRoutesPath = path.resolve(__dirname, '../../routes/stripe.routes.js');
 const orderRoutesPath = path.resolve(__dirname, '../../routes/orderRoutes.js');
 const paymentControllerPath = path.resolve(__dirname, '../../controllers/paymentController.js');
@@ -27,13 +28,15 @@ function mockResponse() {
   };
 }
 
-test('paymentRoutes wires authenticate and isCustomer before create-payment-intent', () => {
-  const source = fs.readFileSync(paymentRoutesPath, 'utf8');
-  const routeBlock = source.slice(source.indexOf("'/create-payment-intent'"));
-
-  assert.ok(routeBlock.includes('authenticate'));
-  assert.ok(routeBlock.includes('isCustomer'));
-  assert.ok(routeBlock.indexOf('authenticate') < routeBlock.indexOf('createPaymentIntent'));
+test('legacy create-payment-intent router and controller are retired', () => {
+  // The client-driven legacy PaymentIntent path (metadata only {orderId}, no
+  // Connect transfer) bypassed the canonical checkout reservation. It is removed
+  // rather than guarded so the release gate can prove an exclusive checkout surface.
+  assert.equal(fs.existsSync(paymentRoutesPath), false);
+  assert.equal(fs.existsSync(paymentControllerPath), false);
+  const appSource = fs.readFileSync(appPath, 'utf8');
+  assert.ok(!appSource.includes("app.use('/api/payments'"));
+  assert.ok(!appSource.toLowerCase().includes('/create-payment-intent'));
 });
 
 test('stripe.routes wires auth middleware on Connect helper routes', () => {
@@ -97,47 +100,6 @@ test('authenticate rejects unauthenticated payment route access', async () => {
 
   assert.equal(calledNext, false);
   assert.equal(res.statusCode, 401);
-});
-
-test('createPaymentIntent rejects orders owned by another customer', async () => {
-  const ORDER_ID = '507f1f77bcf86cd799439011';
-  const originalLoad = Module._load;
-
-  Module._load = function mockLoad(request, parent, isMain) {
-    if (request === '../models/Order') {
-      return {
-        findById: async () => ({
-          _id: ORDER_ID,
-          userId: '507f1f77bcf86cd799439099',
-          paymentStatus: 'pending',
-          totalAmount: 25,
-          currency: 'USD',
-        }),
-      };
-    }
-    if (request === 'stripe') {
-      return () => ({
-        paymentIntents: { create: async () => ({ id: 'pi_should_not_run', client_secret: 'secret' }) },
-      });
-    }
-    return originalLoad.call(this, request, parent, isMain);
-  };
-
-  delete require.cache[paymentControllerPath];
-  const { createPaymentIntent } = require(paymentControllerPath);
-  Module._load = originalLoad;
-
-  const res = mockResponse();
-  await createPaymentIntent(
-    {
-      body: { orderId: ORDER_ID },
-      user: { id: '507f1f77bcf86cd799439012' },
-    },
-    res
-  );
-
-  assert.equal(res.statusCode, 403);
-  assert.match(res.body.message, /Not allowed/i);
 });
 
 test('assertConnectAccountOwnedByUser returns 403 for foreign Connect account', async () => {

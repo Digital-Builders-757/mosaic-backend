@@ -206,7 +206,7 @@ Unsupported states and workflows:
 | Public service detail | `GET /api/public/services/:id` | `GET /api/service/business-service/:id` | Both are registered; prefer public route when ID is known. |
 | Admin order list | `GET /api/orders/admin` | `GET /admin/api/orders` | Both are registered and guarded; frontend may use either known route. |
 | Vendor finance dashboard | `/stripe/*` | `/api/stripe/*` | `/stripe/*` is vendor finance. `/api/stripe/*` is different checkout/webhook scope. |
-| Marketplace checkout | `POST /api/orders/initiate` | `POST /api/payments/create-payment-intent` | Order initiate is preferred. Legacy payment-intent route remains guarded. |
+| Marketplace checkout | `POST /api/orders/initiate` | `POST /api/payments/create-payment-intent` (retired) | Order initiate is the only checkout initiator. The legacy payment-intent route was removed on 2026-11-24 and returns 404. |
 | Connect onboarding | `POST /api/connect/:businessId/account-link` | frontend-only return pages | Backend creates account links; frontend handles UI. |
 
 ### Intentional duplicate mounts

@@ -61,8 +61,8 @@ const bookingRoutes = require('./routes/bookingRoutes')
 
 
 
-// Import Payment and Order Routes
-const paymentRoutes = require('./routes/paymentRoutes');
+// Import Order Routes. The legacy client-driven payment-intent router is retired;
+// checkout initiation is exclusive to the canonical order routes below.
 const orderRoutes = require('./routes/orderRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 
@@ -225,7 +225,6 @@ app.use('/api/cart', cartRoutes);
 
 
 
-app.use('/api/payments', paymentRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/bookings', bookingRoutes)
 const vendorAlertsRoutes = require('./routes/vendorAlertsRoutes');

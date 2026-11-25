@@ -30,9 +30,15 @@ const DEFAULT_DISABLED_PATH = '/__mosaic_release_control/checkout_gate_disabled_
 const REQUIRED_TAG_KEY = 'mosaic:release-control';
 const REQUIRED_TAG_VALUE = 'checkout-initiation';
 
+// Release modes whose live (pre-deployment) build still mounts the legacy
+// payment-intent route, so the active gate must block both checkout initiators.
+// The legacy-retirement bootstrap deploys the first retired SHA over such a
+// build and therefore uses the same dual-path gate as focused-baseline.
+const DUAL_PATH_GATE_MODES = Object.freeze(['focused-baseline', 'legacy-retirement-bootstrap']);
+
 function activePathRegexValues(releaseMode = 'release') {
   if (releaseMode === 'release') return [ACTIVE_PATH_REGEX];
-  if (releaseMode === 'focused-baseline') {
+  if (DUAL_PATH_GATE_MODES.includes(releaseMode)) {
     // Three path evaluations plus one exact method evaluation remain within
     // ALB's per-condition (3) and per-rule (5) match-evaluation limits.
     return [ACTIVE_PATH_REGEX, LEGACY_PAYMENT_PATH_REGEX, LEGACY_PAYMENT_SLASH_REGEX];
@@ -195,7 +201,7 @@ function isProtectedGateRule(rule, releaseMode) {
   const path = (rule.Conditions || []).find((entry) => entry.Field === 'path-pattern');
   const matcher = pathMatcher(path || {});
   if (JSON.stringify(conditionValues(method || {})) !== JSON.stringify(['POST'])) return false;
-  const protectedPaths = releaseMode === 'focused-baseline'
+  const protectedPaths = DUAL_PATH_GATE_MODES.includes(releaseMode)
     ? [ACTIVE_PATH, LEGACY_PAYMENT_PATH]
     : [ACTIVE_PATH];
   return matcher.values.some((value) => protectedPaths.includes(value)) ||
@@ -284,7 +290,7 @@ function inspectGate(snapshot, config, clock, options = {}) {
       gateState: state,
       target: { method: 'POST', path: ACTIVE_PATH, fixedResponseStatus: 503 },
       releaseMode: config.releaseMode || 'release',
-      targets: (config.releaseMode === 'focused-baseline'
+      targets: (DUAL_PATH_GATE_MODES.includes(config.releaseMode)
         ? [ACTIVE_PATH, LEGACY_PAYMENT_PATH]
         : [ACTIVE_PATH]
       ).map((path) => ({ method: 'POST', path, fixedResponseStatus: 503 })),

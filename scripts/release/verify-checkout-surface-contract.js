@@ -165,7 +165,7 @@ function dynamicExpressPostRegistrations(source) {
 }
 
 function analyzeCheckoutSurface({ appSource, paymentRoutesSource, orderRoutesSource, runtimeRouteSources, clock, releaseMode = 'release', baselineProvenance = null }) {
-  if (!['release', 'rollback', 'focused-baseline'].includes(releaseMode)) {
+  if (!['release', 'rollback', 'focused-baseline', 'legacy-retirement-bootstrap'].includes(releaseMode)) {
     throw new Error('Unsupported release mode');
   }
   const paymentsMounted = String(appSource).includes(LEGACY_MOUNT);
