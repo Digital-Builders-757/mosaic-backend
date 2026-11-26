@@ -59,6 +59,10 @@ how to produce its digest reproducibly.
 | Output folder | `recon/test/…` | `recon/live/…` |
 | Digest | `--allow-test-mode` (rehearsal only, never put in the variable) | default; refuses non-live records |
 
+If Production itself has only ever run on Stripe **test** keys, see
+[Production in Stripe test mode](#production-in-stripe-test-mode) instead of
+`--allow-test-mode`.
+
 The script refuses `sk_` keys, refuses a key whose mode differs from
 `--account-mode`, and fails if Stripe returns any object whose `livemode`
 differs from the requested mode. Never mix test and live files in one record.
@@ -237,7 +241,8 @@ node scripts/release/legacy-payment-reconciliation.js digest \
 `digest` refuses the record if any entry is `outstanding-payable` /
 `unknown-status`, any `settled-unmatched` entry lacks an allowed resolution, the
 review block is incomplete, or the record is not live (rehearsals pass
-`--allow-test-mode`; never use that output for the variable).
+`--allow-test-mode`; never use that output for the variable). The only
+exception is the test-mode production attestation below.
 
 Canonicalization (deterministic, independently reproducible):
 
@@ -261,6 +266,89 @@ does not (and cannot) re-derive it from live data. Its value therefore depends
 entirely on the reviewed record being retained in the tracker so anyone can
 recompute it with `digest`. A digest whose record cannot be produced is not
 evidence.
+
+## Production in Stripe test mode
+
+Production has been configured with Stripe **test** keys on one platform
+account, so every intent the retired route created is test-mode. For that case
+only, the owner allows a **test-mode production attestation**. It is a
+different, stricter policy than the `--allow-test-mode` rehearsal (which stays
+rehearsal-only and cannot be combined with the flags below).
+
+`digest` accepts a test-mode record for the variable only when **all** hold
+(otherwise it refuses; there is no silent fallback):
+
+- `--deployment-stripe-mode test` (allowed values: `live`, `test`; any other
+  value is an error; `live` or omitted = the default live-only rule).
+- `--expected-stripe-account acct_…` (must match `^acct_[A-Za-z0-9]+$`) equals
+  the record's `stripe.accountId`, and `stripe.accountVerifiedBy` is
+  `GET /v1/account` (the id was verified at export).
+- `stripe.livemode: false`, `stripe.accountMode: "test"`, and every entry has
+  `livemode: false`. A live record under `--deployment-stripe-mode test` is a
+  mode mismatch and is refused.
+- `review.stripeModeHistory` is complete and consistent (below).
+- All normal rules still apply (no `outstanding-payable` / `unknown-status`,
+  every `settled-unmatched` resolved, complete `review` block).
+
+A current `sk_test_` / `rk_test_` key does **not** prove live payments were
+never configured, so a reviewer attests the deployment's Stripe mode history
+with checkable references:
+
+```json
+"review": {
+  "decision": "approved-no-outstanding-legacy-liability",
+  "reviewers": ["<github-handle>"],
+  "reviewedAt": "2026-11-25T12:00:00Z",
+  "notes": null,
+  "stripeModeHistory": {
+    "deploymentMode": "test",
+    "account": "acct_…",
+    "livePaymentsEverConfigured": false,
+    "evidence": [
+      { "source": "aws-ssm-parameter-history", "reference": "<param name + version range, all sk_test_>", "checkedAt": "2026-11-25T10:00:00Z" },
+      { "source": "stripe-dashboard", "reference": "<live-mode payments view for acct_…: none>", "checkedAt": "2026-11-25T10:15:00Z" }
+    ],
+    "verifiedBy": "<github-handle>",
+    "verifiedAt": "2026-11-25T11:00:00Z"
+  }
+}
+```
+
+`deploymentMode` must be exactly `test`, `account` must equal
+`--expected-stripe-account`, `livePaymentsEverConfigured` must be the boolean
+`false`, `evidence` is a non-empty array whose items each have non-empty
+`source` and `reference` and an ISO-8601 `checkedAt`; `verifiedBy` is
+non-empty and `verifiedAt` is ISO-8601. References point to where a second
+person can re-check (never paste key values).
+
+```bash
+STRIPE_RECONCILIATION_READ_KEY=rk_test_… node scripts/release/legacy-payment-reconciliation.js export \
+  --account-mode test --stripe-account acct_… --created-lte <unix> --output recon/prod-test/stripe-export.json
+node scripts/release/legacy-payment-reconciliation.js match \
+  --stripe-export recon/prod-test/stripe-export.json --orders-export recon/prod-test/orders.json \
+  --output recon/prod-test/record.json
+# … resolve blockers, fill review + review.stripeModeHistory …
+node scripts/release/legacy-payment-reconciliation.js digest \
+  --record recon/prod-test/record.json \
+  --deployment-stripe-mode test --expected-stripe-account acct_… \
+  --canonical-output recon/prod-test/record.canonical.json
+```
+
+The orders export comes from the **production** database (read-only user),
+even though the Stripe key is a test key. The hashed bytes are the record plus
+a top-level `deploymentAttestation: { deploymentStripeMode: "test",
+expectedStripeAccount }` added by `digest` (the input record must not already
+contain that key), so the mode, account, and evidence are bound into the
+digest and a test-mode digest can never equal a live digest of the same
+entries. `sha256sum record.canonical.json` still equals the printed digest;
+recomputing requires the same two flags. If live keys are ever configured on
+Production, this attestation no longer applies: reconcile live mode as well.
+
+Recompute from `record.json`, not `record.canonical.json`: `digest` refuses
+any record that already contains `deploymentAttestation` (on every path), and
+the canonical file does. To verify a canonical file on its own, `sha256sum`
+it, or remove its `deploymentAttestation` key and re-run `digest` with the
+`--deployment-stripe-mode` / `--expected-stripe-account` values that key named.
 
 ## What this procedure never does
 
