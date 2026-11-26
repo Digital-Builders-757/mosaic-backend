@@ -297,6 +297,11 @@ function countingClient(fixture) {
 }
 
 test('narrow refuses malformed infrastructure before any mutation, in the uniform and the mixed shape', () => {
+  const expected = {
+    'missing ownership tag': /ownership tag/,
+    'duplicate protected rule': /unpinned listener rule/,
+    'load balancer not active': /identity or state/,
+  };
   const breakers = {
     'missing ownership tag': (fixture) => { fixture.tags.TagDescriptions[1].Tags = []; },
     'duplicate protected rule': (fixture) => {
@@ -313,7 +318,7 @@ test('narrow refuses malformed infrastructure before any mutation, in the unifor
       const fixture = gateFixture(httpsMode, 'legacy-retirement-bootstrap');
       breakIt(fixture);
       const { client, mutations } = countingClient(fixture);
-      assert.throws(() => gateApi.narrowGate(client, gateConfig('legacy-retirement-bootstrap')), undefined, `${name} / ${httpsMode}`);
+      assert.throws(() => gateApi.narrowGate(client, gateConfig('legacy-retirement-bootstrap')), expected[name], `${name} / ${httpsMode}`);
       assert.equal(mutations(), 0, `${name} / ${httpsMode}: no mutation`);
     }
   }
@@ -345,4 +350,12 @@ test('bootstrap verify and disable never treat a narrowed rule as the dual-path 
   const { client, mutations } = countingClient(gateFixture('release'));
   assert.throws(() => gateApi.transitionGate(client, 'inactive', gateConfig('legacy-retirement-bootstrap')));
   assert.equal(mutations(), 0);
+});
+
+test('pre-deploy bootstrap enable widens an existing canonical gate to the strict dual path', () => {
+  const { client, observations, order } = watchedClient(gateFixture('release'));
+  assert.equal(gateApi.transitionGate(client, 'active', gateConfig('legacy-retirement-bootstrap')).operation, 'widened');
+  assert.deepEqual(order, [HTTPS_RULE_ARN, HTTP_RULE_ARN]);
+  assert.ok(observations.every(Boolean));
+  assert.equal(gateApi.verifyGate(client, 'active', gateConfig('legacy-retirement-bootstrap')).gateState, 'active');
 });

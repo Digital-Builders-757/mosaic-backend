@@ -174,8 +174,9 @@ function validateRuleShape(rule, expectedPriority, config, label, options = {}) 
   }
   const matcher = pathMatcher(pathConditions[0]);
   // A bootstrap gate that was (partly) narrowed in place to the canonical
-  // initiate-only shape is still active: initiate stays blocked. Only callers
-  // that explicitly opt in (narrow, fail-safe enable) accept that shape.
+  // initiate-only shape is still active: initiate stays blocked. Only narrow and
+  // every bootstrap-mode enable (pre-deploy enable and the fail-safe) opt in;
+  // enable then widens those rules back to the strict dual-path shape.
   const acceptedActiveSets = [activePathRegexValues(config.releaseMode)];
   if (options.acceptNarrowed && config.releaseMode === 'legacy-retirement-bootstrap') {
     acceptedActiveSets.push(activePathRegexValues('release'));

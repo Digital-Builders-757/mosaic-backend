@@ -115,6 +115,9 @@ already live), so it means either a new certified `main` SHA dispatched with
   narrowed) is handled the same way: the fail-safe `enable` recognizes the
   narrowed rules and widens them back to the dual-path shape in place; initiate
   stays blocked throughout.
+- The pre-deploy bootstrap enable does the same: an existing canonical
+  (initiate-only) active gate is widened in place to the dual-path shape before
+  the drain, so the legacy route is blocked before the retired build deploys.
 - After such a failure the gate is dual-path again, which later `release` and
   `rollback` runs do not recognize. Once the retired build is verified, an
   authorized infrastructure owner narrows it manually:
