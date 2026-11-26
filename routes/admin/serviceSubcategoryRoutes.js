@@ -10,10 +10,9 @@ const {
 const authenticate = require('../../middlewares/authenticate');
 const isAdmin = require('../../middlewares/isAdmin');
 
-router.get('/', getServiceSubcategories);
-
 router.use(authenticate, isAdmin);
 
+router.get('/', getServiceSubcategories);
 router.post('/', createServiceSubcategory);
 router.put('/:id', updateServiceSubcategory);
 router.delete('/:id', deleteServiceSubcategory);

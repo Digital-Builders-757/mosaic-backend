@@ -10,10 +10,9 @@ const {
 const authenticate = require('../../middlewares/authenticate');
 const isAdmin = require('../../middlewares/isAdmin');
 
-router.get('/', getFoodSubcategories);
-
 router.use(authenticate, isAdmin);
 
+router.get('/', getFoodSubcategories);
 router.post('/', createFoodSubcategory);
 router.put('/:id', updateFoodSubcategory);
 router.delete('/:id', deleteFoodSubcategory);

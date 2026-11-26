@@ -944,7 +944,16 @@ const listSubcategories = async (req, res) => {
     }
 
     const filter = {};
-    if (catId) filter.category = catId;
+    if (catId) {
+      filter.category = catId;
+    } else {
+      // No parent filter: only expose subcategories whose parent category is
+      // itself publicly visible (excludes hidden/archived/deleted/test parents).
+      const publicParents = filterPublicCategories(
+        await ProductCategory.find(buildPublicCategoryFilter()).lean()
+      );
+      filter.category = { $in: publicParents.map((cat) => cat._id) };
+    }
     if (q) filter.name = { $regex: escapeRegex(String(q)), $options: 'i' };
 
     const subs = await ProductSubcategory
