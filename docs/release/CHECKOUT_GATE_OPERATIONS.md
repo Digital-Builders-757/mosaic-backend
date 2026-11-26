@@ -30,9 +30,13 @@ After that one approval, the serialized job:
    identity, auth guard, CORS, and canonical featured-products endpoint while
    checkout remains gated.
 8. Runs the same reservation proof again and requires zero.
-9. Disables both rules and proves normal unauthenticated checkout behavior (for
-   example `401`, never `503`), exact release identity, health, readiness, and
-   webhook reachability.
+9. Only when dispatched with `checkout_after_release=open`: disables both rules
+   and proves normal unauthenticated checkout behavior (for example `401`, never
+   `503`), exact release identity, health, readiness, and webhook reachability.
+   Otherwise (`keep-closed`, the default and the only push-triggered policy) it
+   leaves the gate active and proves `503`, the exact release identity, and the
+   retired legacy route `404`/`405`. A legacy-retirement bootstrap first narrows
+   its dual-path gate in place to the canonical shape.
 10. Uploads sanitized release evidence and comments a concise result on the
     source release PR.
 

@@ -41,6 +41,14 @@ on:
         description: Rollback - type BREAK GLASS ROLLBACK EXACT SHA; legacy-retirement-bootstrap - type BOOTSTRAP LEGACY PAYMENT RETIREMENT EXACT SHA
         required: false
         type: string
+      checkout_after_release:
+        description: keep-closed (default) leaves the checkout gate active after the verified deploy; open removes it
+        required: true
+        type: choice
+        options:
+          - keep-closed
+          - open
+        default: keep-closed
 
 concurrency:
   group: mosaic-production-release
@@ -72,6 +80,7 @@ jobs:
       baseline_sha: ${{ steps.resolve.outputs.baseline_sha }}
       release_ref: ${{ steps.resolve.outputs.release_ref }}
       source_pr: ${{ steps.resolve.outputs.source_pr }}
+      checkout_after_release: ${{ steps.checkout-policy.outputs.checkout_after_release }}
     steps:
       - name: Checkout main history
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -107,6 +116,20 @@ jobs:
             --legacy-retirement-sha "$LEGACY_PAYMENT_RETIREMENT_SHA" \
             --legacy-reconciliation-sha256 "$LEGACY_PAYMENT_RECONCILIATION_SHA256" \
             --output release-evidence/release-identity.json
+
+      - name: Resolve post-release checkout policy
+        id: checkout-policy
+        env:
+          # Push-triggered releases never open checkout. Only an explicit
+          # workflow_dispatch with checkout_after_release=open removes the gate.
+          REQUESTED_CHECKOUT_POLICY: ${{ github.event_name == 'workflow_dispatch' && inputs.checkout_after_release || 'keep-closed' }}
+        run: |
+          case "$REQUESTED_CHECKOUT_POLICY" in
+            keep-closed|open) ;;
+            *) echo "::error::checkout_after_release must be keep-closed or open"; exit 1 ;;
+          esac
+          echo "checkout_after_release=$REQUESTED_CHECKOUT_POLICY" >> "$GITHUB_OUTPUT"
+          echo "- Checkout after release: $REQUESTED_CHECKOUT_POLICY" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload release identity
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -463,6 +486,7 @@ jobs:
     env:
       RELEASE_SHA: ${{ needs.resolve-release.outputs.release_sha }}
       RELEASE_MODE: ${{ needs.resolve-release.outputs.release_mode }}
+      CHECKOUT_AFTER_RELEASE: ${{ needs.resolve-release.outputs.checkout_after_release }}
       FOCUSED_BASELINE_SHA: ${{ needs.resolve-release.outputs.baseline_sha }}
       FOCUSED_RELEASE_REF: ${{ needs.resolve-release.outputs.release_ref }}
       FOCUSED_SOURCE_PR: ${{ needs.resolve-release.outputs.source_pr }}
@@ -752,7 +776,7 @@ jobs:
 
       - name: Disable exact checkout gate
         id: ungate
-        if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' }}
+        if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' && needs.resolve-release.outputs.checkout_after_release == 'open' }}
         run: |
           node scripts/release/manage-checkout-gate.js disable \
             --confirm DISABLE_CHECKOUT_GATE \
@@ -761,7 +785,7 @@ jobs:
 
       - name: Prove normal checkout and exact production health
         id: final-open
-        if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' }}
+        if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' && needs.resolve-release.outputs.checkout_after_release == 'open' }}
         run: |
           mode_args=()
           if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
@@ -783,6 +807,43 @@ jobs:
           echo "safe_open=true" >> "$GITHUB_OUTPUT"
 
 
+      - name: Narrow bootstrap gate to the retired build without opening checkout
+        id: narrow
+        if: ${{ needs.resolve-release.outputs.release_mode == 'legacy-retirement-bootstrap' && needs.resolve-release.outputs.checkout_after_release == 'keep-closed' }}
+        run: |
+          # In-place rule modification: POST /api/orders/initiate is blocked by
+          # both the dual-path and the narrowed shape at every instant.
+          node scripts/release/manage-checkout-gate.js narrow \
+            --release-mode legacy-retirement-bootstrap \
+            --confirm NARROW_CHECKOUT_GATE \
+            --output release-evidence/gate-narrowed.json
+
+      - name: Prove checkout stays closed on the exact release
+        id: kept-closed
+        if: ${{ needs.resolve-release.outputs.release_mode != 'focused-baseline' && needs.resolve-release.outputs.checkout_after_release == 'keep-closed' }}
+        env:
+          # After narrowing, the bootstrap gate is the canonical single-path
+          # initiate gate that release and rollback also use.
+          RELEASE_MODE: release
+        run: |
+          node scripts/release/manage-checkout-gate.js verify \
+            --release-mode release \
+            --expected-state active \
+            --output release-evidence/gate-final.json
+          bash scripts/release/verify-checkout-gate.sh \
+            --release-mode release \
+            "$PRODUCTION_API_URL" \
+            "http://api.mosaicbizhub.com"
+          # Exact SHA and health, with the retired legacy route answering
+          # 404/405 from the application while initiate stays at the ALB 503.
+          node scripts/release/verify-production-public-surfaces.js \
+            --mode deployed \
+            --release-mode release \
+            --base-url "$PRODUCTION_API_URL" \
+            --expected-sha "$RELEASE_SHA" \
+            --output release-evidence/public-kept-closed.json
+          echo "safe_gated=true" >> "$GITHUB_OUTPUT"
+
       - name: Confirm focused checkout gate remains active
         id: focused-final-gate
         if: ${{ needs.resolve-release.outputs.release_mode == 'focused-baseline' }}
@@ -798,7 +859,7 @@ jobs:
           echo "safe_gated=true" >> "$GITHUB_OUTPUT"
 
       - name: Refresh AWS credentials for fail-safe gate control
-        if: ${{ always() && steps.gate.outputs.attempted == 'true' && steps.final-open.outputs.safe_open != 'true' }}
+        if: ${{ always() && steps.gate.outputs.attempted == 'true' && steps.final-open.outputs.safe_open != 'true' && steps.kept-closed.outputs.safe_gated != 'true' }}
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
         with:
           role-to-assume: ${{ vars.AWS_RELEASE_CONTROL_ROLE_TO_ASSUME }}
@@ -806,7 +867,7 @@ jobs:
           output-credentials: false
 
       - name: Reassert safe gate after any post-enable failure
-        if: ${{ always() && steps.gate.outputs.attempted == 'true' && steps.final-open.outputs.safe_open != 'true' }}
+        if: ${{ always() && steps.gate.outputs.attempted == 'true' && steps.final-open.outputs.safe_open != 'true' && steps.kept-closed.outputs.safe_gated != 'true' }}
         run: |
           node scripts/release/manage-checkout-gate.js enable \
             --confirm ENABLE_CHECKOUT_GATE \
@@ -822,6 +883,7 @@ jobs:
             --directory release-evidence \
             --release-sha "$RELEASE_SHA" \
             --release-mode "$RELEASE_MODE" \
+            --checkout-after-release "$CHECKOUT_AFTER_RELEASE" \
             --job-status "$JOB_STATUS" \
             --run-url "$RUN_URL" \
             --output release-evidence/production-release-evidence.json
@@ -889,6 +951,7 @@ jobs:
           RELEASE_JOB_RESULT: ${{ needs.production-approval-and-release.result }}
           NORMAL_RELEASE: ${{ needs.resolve-release.outputs.normal_release || 'unknown' }}
           RELEASE_MODE: ${{ needs.resolve-release.outputs.release_mode || 'unknown' }}
+          CHECKOUT_AFTER_RELEASE: ${{ needs.resolve-release.outputs.checkout_after_release || 'keep-closed' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p release-evidence
@@ -923,6 +986,7 @@ jobs:
             --directory release-evidence \
             --release-sha "$RELEASE_SHA" \
             --release-mode "$RELEASE_MODE" \
+            --checkout-after-release "$CHECKOUT_AFTER_RELEASE" \
             --job-status "$job_status" \
             --run-url "$RUN_URL" \
             --output release-evidence/production-release-summary.json
