@@ -55,6 +55,7 @@ test('checkout policy defaults to keep-closed and only an explicit dispatch can 
 test('the only gate-disable command in the release workflow runs solely under checkout_after_release == open', () => {
   const disables = workflow.match(/manage-checkout-gate\.js disable/g) || [];
   assert.equal(disables.length, 1, 'exactly one gate disable command is allowed');
+  assert.equal((workflow.match(/DISABLE_CHECKOUT_GATE/g) || []).length, 1, 'exactly one disable confirmation is allowed');
   const ungate = step('Disable exact checkout gate');
   assert.match(ungate, /manage-checkout-gate\.js disable/);
   assert.match(ungate, /if: \$\{\{ [^\n]*needs\.resolve-release\.outputs\.checkout_after_release == 'open' [^\n]*\}\}/);
@@ -72,6 +73,7 @@ test('keep-closed release narrows the bootstrap gate and proves initiate 503 wit
 
   const kept = step('Prove checkout stays closed on the exact release');
   assert.match(kept, /id: kept-closed/);
+  assert.match(kept, /env:\n\s+(?:#[^\n]*\n\s+)*RELEASE_MODE: release\n/);
   assert.match(kept, /release_mode != 'focused-baseline' && needs\.resolve-release\.outputs\.checkout_after_release == 'keep-closed'/);
   assert.match(kept, /manage-checkout-gate\.js verify \\\n\s+--release-mode release \\\n\s+--expected-state active/);
   assert.match(kept, /verify-checkout-gate\.sh \\\n\s+--release-mode release/);
@@ -86,6 +88,8 @@ test('keep-closed release narrows the bootstrap gate and proves initiate 503 wit
 test('fail-safe re-gating still covers every unproven ending, including a failed keep-closed proof', () => {
   const condition = "${{ always() && steps.gate.outputs.attempted == 'true' && steps.final-open.outputs.safe_open != 'true' && steps.kept-closed.outputs.safe_gated != 'true' }}";
   assert.equal(workflow.split(condition).length - 1, 2);
+  assert.ok(step('Refresh AWS credentials for fail-safe gate control').includes(`if: ${condition}`));
+  assert.ok(step('Reassert safe gate after any post-enable failure').includes(`if: ${condition}`));
 });
 
 test('both evidence builders receive the resolved checkout policy', () => {
@@ -148,20 +152,23 @@ function regexValues(client, ruleArn) {
 function watchedClient(fixture) {
   const client = gateApi.createFixtureGateClient(fixture);
   const observations = [];
+  const order = [];
   const modifyRule = client.modifyRule.bind(client);
   client.modifyRule = (ruleArn, pathValue, releaseMode) => {
+    order.push(ruleArn);
     modifyRule(ruleArn, pathValue, releaseMode);
     // After every single ALB mutation, both rules must still block initiate.
     observations.push([HTTP_RULE_ARN, HTTPS_RULE_ARN].every((arn) =>
       regexValues(client, arn).includes(gateApi.ACTIVE_PATH_REGEX)));
   };
-  return { client, observations };
+  return { client, observations, order };
 }
 
 test('narrow keeps initiate blocked at every mutation and leaves the canonical release gate active', () => {
-  const { client, observations } = watchedClient(gateFixture('legacy-retirement-bootstrap'));
+  const { client, observations, order } = watchedClient(gateFixture('legacy-retirement-bootstrap'));
   const result = gateApi.narrowGate(client, gateConfig('legacy-retirement-bootstrap'));
   assert.equal(result.operation, 'narrowed');
+  assert.deepEqual(order, [HTTPS_RULE_ARN, HTTP_RULE_ARN], 'HTTPS is narrowed first');
   assert.equal(result.gateState, 'active');
   assert.deepEqual(observations, [true, true]);
   // Every later release and rollback reads this shape as an active gate.
@@ -277,4 +284,65 @@ test('evidence CLI validates the checkout policy', () => {
   const base = ['--directory', 'd', '--output', 'o', '--release-sha', SHA, '--job-status', 'success'];
   assert.equal(parseArgs([...base, '--checkout-after-release', 'keep-closed'])['checkout-after-release'], 'keep-closed');
   assert.throws(() => parseArgs([...base, '--checkout-after-release', 'opened']), /keep-closed or open/);
+});
+
+// --- review follow-ups: structural refusal before mutation, fail-safe widening --
+
+function countingClient(fixture) {
+  const client = gateApi.createFixtureGateClient(fixture);
+  let mutations = 0;
+  const modifyRule = client.modifyRule.bind(client);
+  client.modifyRule = (...args) => { mutations += 1; return modifyRule(...args); };
+  return { client, mutations: () => mutations };
+}
+
+test('narrow refuses malformed infrastructure before any mutation, in the uniform and the mixed shape', () => {
+  const breakers = {
+    'missing ownership tag': (fixture) => { fixture.tags.TagDescriptions[1].Tags = []; },
+    'duplicate protected rule': (fixture) => {
+      fixture.rulesByListener[HTTPS_LISTENER_ARN].Rules.push({
+        RuleArn: `${HTTPS_RULE_ARN}-dup`, Priority: '5', IsDefault: false,
+        Conditions: gateApi.gateConditions(gateApi.ACTIVE_PATH, 'release'),
+        Actions: [{ Type: 'fixed-response', FixedResponseConfig: { StatusCode: '503' } }],
+      });
+    },
+    'load balancer not active': (fixture) => { fixture.loadBalancers.LoadBalancers[0].State.Code = 'provisioning'; },
+  };
+  for (const [name, breakIt] of Object.entries(breakers)) {
+    for (const httpsMode of ['legacy-retirement-bootstrap', 'release']) {
+      const fixture = gateFixture(httpsMode, 'legacy-retirement-bootstrap');
+      breakIt(fixture);
+      const { client, mutations } = countingClient(fixture);
+      assert.throws(() => gateApi.narrowGate(client, gateConfig('legacy-retirement-bootstrap')), undefined, `${name} / ${httpsMode}`);
+      assert.equal(mutations(), 0, `${name} / ${httpsMode}: no mutation`);
+    }
+  }
+});
+
+test('fail-safe bootstrap enable widens a narrowed or half-narrowed gate back to the dual path', () => {
+  for (const [httpsMode, httpMode, expectedOrder] of [
+    ['release', 'release', [HTTPS_RULE_ARN, HTTP_RULE_ARN]],
+    ['release', 'legacy-retirement-bootstrap', [HTTPS_RULE_ARN]],
+  ]) {
+    const { client, observations, order } = watchedClient(gateFixture(httpsMode, httpMode));
+    const result = gateApi.transitionGate(client, 'active', gateConfig('legacy-retirement-bootstrap'));
+    assert.equal(result.operation, 'widened');
+    assert.equal(result.gateState, 'active');
+    assert.deepEqual(order, expectedOrder);
+    assert.ok(observations.every(Boolean), 'initiate stays blocked while widening');
+    assert.equal(gateApi.verifyGate(client, 'active', gateConfig('legacy-retirement-bootstrap')).gateState, 'active');
+  }
+  // A uniform dual-path gate stays idempotent (no mutation).
+  const { client, order } = watchedClient(gateFixture('legacy-retirement-bootstrap'));
+  assert.equal(gateApi.transitionGate(client, 'active', gateConfig('legacy-retirement-bootstrap')).operation, 'idempotent');
+  assert.deepEqual(order, []);
+});
+
+test('bootstrap verify and disable never treat a narrowed rule as the dual-path gate', () => {
+  const half = gateFixture('release', 'legacy-retirement-bootstrap');
+  assert.throws(() => gateApi.verifyGate(gateApi.createFixtureGateClient(half), 'active', gateConfig('legacy-retirement-bootstrap')),
+    /not a recognized exact gate state/);
+  const { client, mutations } = countingClient(gateFixture('release'));
+  assert.throws(() => gateApi.transitionGate(client, 'inactive', gateConfig('legacy-retirement-bootstrap')));
+  assert.equal(mutations(), 0);
 });

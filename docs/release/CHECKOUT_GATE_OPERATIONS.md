@@ -36,7 +36,9 @@ After that one approval, the serialized job:
    Otherwise (`keep-closed`, the default and the only push-triggered policy) it
    leaves the gate active and proves `503`, the exact release identity, and the
    retired legacy route `404`/`405`. A legacy-retirement bootstrap first narrows
-   its dual-path gate in place to the canonical shape.
+   its dual-path gate in place to the canonical shape. This also applies to
+   push-triggered releases and break-glass rollbacks: they end with checkout
+   closed unless dispatched with `open`.
 10. Uploads sanitized release evidence and comments a concise result on the
     source release PR.
 

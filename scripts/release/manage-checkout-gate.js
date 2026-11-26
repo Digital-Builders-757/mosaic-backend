@@ -142,7 +142,7 @@ function pathMatcher(condition) {
   return { values, regexValues };
 }
 
-function validateRuleShape(rule, expectedPriority, config, label) {
+function validateRuleShape(rule, expectedPriority, config, label, options = {}) {
   if (!rule || rule.IsDefault === true || rule.Priority === 'default') {
     throw new Error(`${label} is missing or is the default listener rule`);
   }
@@ -173,9 +173,15 @@ function validateRuleShape(rule, expectedPriority, config, label) {
     throw new Error(`${label} must match only HTTP method POST`);
   }
   const matcher = pathMatcher(pathConditions[0]);
+  // A bootstrap gate that was (partly) narrowed in place to the canonical
+  // initiate-only shape is still active: initiate stays blocked. Only callers
+  // that explicitly opt in (narrow, fail-safe enable) accept that shape.
+  const acceptedActiveSets = [activePathRegexValues(config.releaseMode)];
+  if (options.acceptNarrowed && config.releaseMode === 'legacy-retirement-bootstrap') {
+    acceptedActiveSets.push(activePathRegexValues('release'));
+  }
   const active = matcher.values.length === 0
-    && JSON.stringify(matcher.regexValues) ===
-      JSON.stringify(activePathRegexValues(config.releaseMode));
+    && acceptedActiveSets.some((set) => JSON.stringify(matcher.regexValues) === JSON.stringify(set));
   const inactive = matcher.regexValues.length === 0
     && JSON.stringify(matcher.values) === JSON.stringify([config.disabledPath]);
   if (!active && !inactive) {
@@ -254,8 +260,13 @@ function inspectGate(snapshot, config, clock, options = {}) {
       rule,
       item.rulePriority,
       config,
-      `${item.protocol}/${item.port} gate rule`
+      `${item.protocol}/${item.port} gate rule`,
+      { acceptNarrowed: options.acceptNarrowed === true }
     );
+    const narrowed = state === 'active'
+      && config.releaseMode === 'legacy-retirement-bootstrap'
+      && JSON.stringify(pathMatcher(rule.Conditions.find((entry) => entry.Field === 'path-pattern')).regexValues)
+        === JSON.stringify(activePathRegexValues('release'));
     if (!hasRequiredTag(tagsFor(snapshot, item.ruleArn), config)) {
       throw new Error(`${item.protocol}/${item.port} gate rule lacks its pinned ownership tag`);
     }
@@ -266,6 +277,7 @@ function inspectGate(snapshot, config, clock, options = {}) {
       ruleArn: item.ruleArn,
       priority: item.rulePriority,
       state,
+      narrowed,
     });
   }
   if (config.httpRuleArn === config.httpsRuleArn) {
@@ -404,9 +416,32 @@ function transitionGate(client, desiredState, config, clock) {
   // the recovery operation, so validate both pinned rule shapes while allowing
   // that one mixed state. Malformed/unpinned infrastructure still fails before
   // any mutation.
-  const before = inspectGate(client.read(), config, clock, { allowMixed: true });
+  const acceptNarrowed = desiredState === 'active' && config.releaseMode === 'legacy-retirement-bootstrap';
+  const before = inspectGate(client.read(), config, clock, { allowMixed: true, acceptNarrowed });
   if (before.state === desiredState) {
-    return { ...before.evidence, operation: 'idempotent' };
+    const narrowedRecords = before.records.filter((record) => record.narrowed);
+    if (narrowedRecords.length === 0) {
+      return { ...before.evidence, operation: 'idempotent' };
+    }
+    // Fail-safe after a (partial) keep-closed narrow: widen the narrowed rules
+    // back to the dual-path shape. Both shapes block initiate at every instant.
+    try {
+      for (const record of [...narrowedRecords].sort((left, right) => right.port - left.port)) {
+        client.modifyRule(record.ruleArn, ACTIVE_PATH, config.releaseMode);
+      }
+      const widened = inspectGate(client.read(), config, clock);
+      if (widened.state !== 'active') throw new Error('Gate did not reach the dual-path active state');
+      return { ...widened.evidence, operation: 'widened' };
+    } catch (_error) {
+      const recovered = forceActive(client, config);
+      const error = new Error(
+        recovered
+          ? 'Gate widening failed; fail-safe recovery left the dual-path checkout gate active'
+          : 'Gate widening failed and active fail-safe could not be verified'
+      );
+      error.gateState = recovered ? 'active' : 'unknown';
+      throw error;
+    }
   }
   if (before.state === 'mixed' && desiredState === 'inactive') {
     const recovered = forceActive(client, config);
@@ -450,52 +485,27 @@ function transitionGate(client, desiredState, config, clock) {
 // /api/orders/initiate is blocked by both shapes at every instant; checkout is
 // never opened. The single-path shape is the one every later release/rollback
 // recognizes. Any failure re-asserts the dual-path (superset) active gate.
-function pendingNarrowRules(snapshot, dualConfig, narrowedConfig) {
-  // Full structural checks (load balancer, listeners, tags, duplicates) in
-  // whichever shape the gate is uniformly in; a mixed gate is checked per rule.
-  let uniform = null;
-  try {
-    uniform = inspectGate(snapshot, dualConfig);
-  } catch (_error) {
-    uniform = null;
-  }
-  if (uniform) {
-    if (uniform.state !== 'active') throw new Error('Refused to narrow a checkout gate that is not active');
-    return [...uniform.records].sort((left, right) => right.port - left.port).map((record) => record.ruleArn);
-  }
-  const allRules = Object.values(snapshot.rulesByListener || {}).flatMap((response) => response.Rules || []);
-  const pending = [];
-  for (const [ruleArn, rulePriority, label] of [
-    [dualConfig.httpsRuleArn, dualConfig.httpsPriority, 'HTTPS/443 gate rule'],
-    [dualConfig.httpRuleArn, dualConfig.httpPriority, 'HTTP/80 gate rule'],
-  ]) {
-    const rule = allRules.find((candidate) => candidate.RuleArn === ruleArn);
-    let dualState = null;
-    let narrowState = null;
-    try { dualState = validateRuleShape(rule, rulePriority, dualConfig, label); } catch (_error) { dualState = null; }
-    try { narrowState = validateRuleShape(rule, rulePriority, narrowedConfig, label); } catch (_error) { narrowState = null; }
-    if (dualState === 'active') pending.push(ruleArn);
-    else if (narrowState !== 'active') throw new Error(`Refused to narrow: ${label} is not an active gate rule`);
-  }
-  return pending;
-}
-
 function narrowGate(client, config, clock) {
   if (config.releaseMode !== 'legacy-retirement-bootstrap') {
     throw new Error('narrow is only valid for the legacy-retirement-bootstrap gate');
   }
   const narrowedConfig = { ...config, releaseMode: 'release' };
-  // Idempotent when a previous attempt already narrowed both listeners.
-  try {
-    const already = inspectGate(client.read(), narrowedConfig, clock);
-    if (already.state === 'active') return { ...already.evidence, operation: 'idempotent-narrowed' };
-  } catch (_error) {
-    // Not (fully) narrowed yet: fall through to the strict dual-path read.
+  // One full structural inspection (load balancer, listeners, pinned rules,
+  // tags, duplicate protected rules) before any mutation. Each pinned rule must
+  // be active in the dual-path shape or, after an interrupted earlier attempt,
+  // already narrowed. Anything else, including an inactive rule, is refused.
+  const before = inspectGate(client.read(), config, clock, { acceptNarrowed: true });
+  if (before.state !== 'active') {
+    throw new Error('Refused to narrow a checkout gate that is not active');
   }
-  // Every pinned rule must be active in either the dual-path shape or (after an
-  // interrupted earlier attempt) the narrowed shape. Anything else, including
-  // an inactive rule, is refused before any mutation.
-  const pending = pendingNarrowRules(client.read(), config, narrowedConfig);
+  const pending = before.records
+    .filter((record) => !record.narrowed)
+    .sort((left, right) => right.port - left.port)
+    .map((record) => record.ruleArn);
+  if (pending.length === 0) {
+    const already = inspectGate(client.read(), narrowedConfig, clock);
+    return { ...already.evidence, operation: 'idempotent-narrowed' };
+  }
   try {
     // HTTPS (canonical public surface) first, then HTTP.
     for (const ruleArn of pending) {
