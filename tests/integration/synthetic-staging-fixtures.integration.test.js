@@ -89,6 +89,14 @@ async function totalDocuments() {
   });
 }
 
+// mongoose.connect() with default autoIndex starts background index builds for
+// every registered model. Wait for them before disconnecting, or a build can
+// finish later and race the schema snapshots taken by the dry-run test.
+async function disconnectAfterIndexBuilds() {
+  await Promise.allSettled(Object.values(mongoose.models).map((model) => model.init()));
+  await mongoose.disconnect();
+}
+
 describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
   let unmarked;
 
@@ -155,7 +163,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       subscriptionPlanId: plan._id,
     });
     unmarked = { plan, owner, subscription, business };
-    await mongoose.disconnect();
+    await disconnectAfterIndexBuilds();
   });
 
   after(async () => {
@@ -172,7 +180,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       assert.match(output, /connection is already open/);
       assert.equal(await totalDocuments(), before);
     } finally {
-      await mongoose.disconnect();
+      await disconnectAfterIndexBuilds();
     }
   });
 
@@ -274,7 +282,7 @@ describe('synthetic staging fixture seeder (in-memory Mongo)', () => {
       const product = await mongoose.model('Product').findOne({ fixtureTag: FIXTURE_TAG });
       await product.validate();
     } finally {
-      await mongoose.disconnect();
+      await disconnectAfterIndexBuilds();
     }
   });
 
