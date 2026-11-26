@@ -68,9 +68,28 @@ checks only run when `release_mode == legacy-retirement-bootstrap`.
    and only `release`/`rollback` apply. Even if the variable were forgotten,
    the binding step refuses because the live tree no longer exposes the route.
 
-Approving the bootstrap opens checkout exactly as a normal release does (the
-gate is disabled after the retired build is verified). If checkout must stay
-closed, do not approve; that is a product decision, not a workflow option.
+### Checkout after the release (`checkout_after_release`)
+
+The dispatch input `checkout_after_release` decides whether the release ends
+with checkout open. It defaults to `keep-closed`, and push-triggered runs always
+resolve to `keep-closed`.
+
+- `keep-closed` (default): after the retired build is verified behind the
+  dual-path gate, the job **narrows** both pinned rules in place from the
+  dual-path shape to the canonical single-path `orders/initiate` shape
+  (`manage-checkout-gate.js narrow --confirm NARROW_CHECKOUT_GATE`). Initiate is
+  blocked by both shapes at every instant. It then proves the gate is active
+  (`503` on HTTP and HTTPS), the exact SHA is live, and the retired legacy route
+  answers `404`/`405` from the application. The gate stays on; no disable runs.
+  Later `release`/`rollback` runs recognize the narrowed gate.
+- `open`: the gate is disabled after the verified deploy and normal checkout is
+  proven (`401`), as before.
+
+Opening checkout later is a separate, explicitly authorized action. The
+already-deployed SHA cannot be re-released (preflight refuses an SHA that is
+already live), so it means either a new certified `main` SHA dispatched with
+`checkout_after_release=open`, or the manual disable in
+[`CHECKOUT_GATE_OPERATIONS.md`](CHECKOUT_GATE_OPERATIONS.md).
 
 ## Rollback mode and what becomes valid
 
@@ -91,7 +110,19 @@ closed, do not approve; that is a product decision, not a workflow option.
 ## Failure handling
 
 - Any failure after the gate is enabled re-asserts the **dual-path** gate
-  (fail-safe), so neither initiator reopens.
+  (fail-safe), so neither initiator reopens. With `keep-closed`, a failure
+  after the narrow step (or an interrupted narrow that left one listener
+  narrowed) is handled the same way: the fail-safe `enable` recognizes the
+  narrowed rules and widens them back to the dual-path shape in place; initiate
+  stays blocked throughout.
+- The pre-deploy bootstrap enable does the same: an existing canonical
+  (initiate-only) active gate is widened in place to the dual-path shape before
+  the drain, so the legacy route is blocked before the retired build deploys.
+- After such a failure the gate is dual-path again, which later `release` and
+  `rollback` runs do not recognize. Once the retired build is verified, an
+  authorized infrastructure owner narrows it manually:
+  `RELEASE_MODE=legacy-retirement-bootstrap node scripts/release/manage-checkout-gate.js narrow --release-mode legacy-retirement-bootstrap --confirm NARROW_CHECKOUT_GATE --output release-evidence/manual-gate-narrowed.json`,
+  then `node scripts/release/manage-checkout-gate.js verify --release-mode release --expected-state active --output release-evidence/manual-gate-verified.json`.
 - If EB deployment completed but a later proof failed, the live tree no longer
   mounts the legacy route, so the bootstrap refuses to re-run. Recover by
   recording `LEGACY_PAYMENT_RETIREMENT_SHA` (only after verifying the live SHA
