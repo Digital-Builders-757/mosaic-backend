@@ -54,6 +54,7 @@ test('storefront and edit-page reads return proxy URLs; DB keeps canonical S3 UR
   const storefront = await createAgent(getApp()).get(`/api/public/product/${product._id}`);
   assert.equal(storefront.status, 200);
   assert.equal(storefront.body.data.coverImage, `${PROXY_BASE}/${coverKey}`);
+  assert.deepEqual(storefront.body.data.galleryImages, [`${PROXY_BASE}/${galleryKey}`]);
   assert.ok(!JSON.stringify(storefront.body).includes(S3_BASE), 'no raw private-bucket URL leaks to the storefront');
 
   const editPage = await agent.get(`/api/product/${product._id}`);
