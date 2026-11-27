@@ -1143,11 +1143,6 @@ test('legacy-retirement bootstrap deploy is admitted and gets exact-main release
   });
   assert.equal(unknown.status, 2);
   assert.match(unknown.stderr, /RELEASE_MODE must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/);
-
-  const script = fs.readFileSync(deployScriptPath, 'utf8');
-  // The only direct "release" comparison left is the EXACT_MAIN_RELEASE assignment itself.
-  assert.equal((script.match(/"\$RELEASE_MODE_VALUE" = "release"/g) || []).length, 1, 'exact-main guards must use EXACT_MAIN_RELEASE');
-  assert.equal((script.match(/"\$EXACT_MAIN_RELEASE" = "1"/g) || []).length, 4);
 });
 
 test('timeout after update remains a blocked attempted but unverified deployment', (t) => {

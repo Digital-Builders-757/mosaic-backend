@@ -350,9 +350,11 @@ if [ -z "${PRODUCTION_API_URL:-}" ]; then
   exit 2
 fi
 node scripts/release/manage-checkout-gate.js verify \
+  --release-mode "$RELEASE_MODE_VALUE" \
   --expected-state active \
   --output release-evidence/gate-before-update-environment.json
 bash scripts/release/verify-checkout-gate.sh \
+  --release-mode "$RELEASE_MODE_VALUE" \
   "$PRODUCTION_API_URL" \
   "http://api.mosaicbizhub.com"
 assert_current_main
