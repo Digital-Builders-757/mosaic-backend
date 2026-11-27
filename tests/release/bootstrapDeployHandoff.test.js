@@ -157,7 +157,7 @@ bash() {
   if [ "$1" = scripts/release/verify-checkout-gate.sh ]; then
     shift
     printf 'GATE-SH %s | env=%s\\n' "$*" "$RELEASE_MODE" >> calls.txt
-    [ "$FIXTURE_GATE_ACTIVE" = true ] || return 1
+    [ "$FIXTURE_GATE_SH_ACTIVE" = true ] || return 1
     return 0
   fi
   command bash "$@"
@@ -171,6 +171,8 @@ fake_aws() {
       else echo "fixture-release-bucket historical-baseline.zip"; fi ;;
     's3api put-object'|'elasticbeanstalk create-application-version'|'elasticbeanstalk update-environment') echo '{}' ;;
     's3api head-object')
+      # Echoes the script's own values (it is sourced): the checksum/identity
+      # comparisons always pass here and are NOT covered by this test.
       if [[ "$*" == *Metadata* ]]; then printf '%s %s %s\\n' "$package_checksum_b64" "$RELEASE_SHA" "$package_sha";
       else printf '%s\\n' "$package_checksum_b64"; fi ;;
     'elasticbeanstalk describe-environments') printf 'Ready %s Green\\n' "$VERSION_LABEL" ;;
@@ -186,7 +188,7 @@ source ./deploy.sh "$TARGET_SHA" release-evidence/eb-deployment.json
     const env = {
       AWS_REGION: 'us-east-1', EB_APPLICATION_NAME: 'fixture', EB_ENVIRONMENT_NAME: 'fixture',
       EB_RELEASE_BUCKET: 'fixture-release-bucket', PRODUCTION_API_URL: 'https://api.example.invalid',
-      AWS_CLI: 'fake_aws', FIXTURE_EXISTING: '0', FIXTURE_GATE_ACTIVE: 'true',
+      AWS_CLI: 'fake_aws', FIXTURE_EXISTING: '0', FIXTURE_GATE_ACTIVE: 'true', FIXTURE_GATE_SH_ACTIVE: 'true',
       ...jobEnv, TARGET_SHA: jobEnv.RELEASE_SHA, ...overrides,
     };
     const assignments = Object.entries(env)
@@ -219,9 +221,17 @@ source ./deploy.sh "$TARGET_SHA" release-evidence/eb-deployment.json
   assert.equal(ok.evidence.releaseSha, sha);
 
   // 2. No gate, no deploy: a gate that is not proven active blocks update-environment.
-  const ungated = invoke({ FIXTURE_GATE_ACTIVE: 'false' });
-  assert.notEqual(ungated.status, 0);
-  assert.doesNotMatch(ungated.calls, /^AWS elasticbeanstalk update-environment/m);
+  //    Each verifier blocks on its own, and it is the gate (not an earlier step) that stops it.
+  for (const [override, lastCall] of [
+    [{ FIXTURE_GATE_ACTIVE: 'false' }, /^GATE-JS verify --release-mode legacy-retirement-bootstrap --expected-state active /],
+    [{ FIXTURE_GATE_SH_ACTIVE: 'false' }, /^GATE-SH --release-mode legacy-retirement-bootstrap /],
+  ]) {
+    const ungated = invoke(override);
+    assert.notEqual(ungated.status, 0);
+    assert.match(ungated.lines.at(-1), lastCall, ungated.calls);
+    assert.ok(indexOf(ungated.lines, /^AWS elasticbeanstalk create-application-version /) >= 0, ungated.calls);
+    assert.doesNotMatch(ungated.calls, /^AWS elasticbeanstalk update-environment/m);
+  }
 
   // 3. A reused version must be this exact deterministic package; bootstrap never
   //    falls into the rollback historical-bundle path.
