@@ -32,9 +32,15 @@ if [ "$RELEASE_MODE_VALUE" = "focused-rollback" ]; then
   echo "Focused rollback mutation is disabled until external release gates are complete" >&2
   exit 1
 fi
-if [ "$RELEASE_MODE_VALUE" != "release" ] && [ "$RELEASE_MODE_VALUE" != "rollback" ] && [ "$RELEASE_MODE_VALUE" != "focused-baseline" ]; then
-  echo "RELEASE_MODE must be release, rollback, or focused-baseline" >&2
+if [ "$RELEASE_MODE_VALUE" != "release" ] && [ "$RELEASE_MODE_VALUE" != "rollback" ] && [ "$RELEASE_MODE_VALUE" != "focused-baseline" ] && [ "$RELEASE_MODE_VALUE" != "legacy-retirement-bootstrap" ]; then
+  echo "RELEASE_MODE must be release, rollback, focused-baseline, or legacy-retirement-bootstrap" >&2
   exit 2
+fi
+# The one-time legacy-retirement bootstrap deploys the exact canonical main tip,
+# so it gets every exact-main release guard. RELEASE_MODE_VALUE itself is kept for evidence.
+EXACT_MAIN_RELEASE=0
+if [ "$RELEASE_MODE_VALUE" = "release" ] || [ "$RELEASE_MODE_VALUE" = "legacy-retirement-bootstrap" ]; then
+  EXACT_MAIN_RELEASE=1
 fi
 for name in AWS_REGION_VALUE EB_APPLICATION_VALUE EB_ENVIRONMENT_VALUE EB_RELEASE_BUCKET_VALUE; do
   if [ -z "${!name}" ]; then
@@ -46,7 +52,7 @@ done
 RELEASE_SHA="${RELEASE_SHA,,}"
 VERSION_LABEL="mosaic-$RELEASE_SHA"
 CONTROLLER_SHA=$(git rev-parse --verify HEAD^{commit})
-if [ "$RELEASE_MODE_VALUE" = "release" ] && [ "$CONTROLLER_SHA" != "$RELEASE_SHA" ]; then
+if [ "$EXACT_MAIN_RELEASE" = "1" ] && [ "$CONTROLLER_SHA" != "$RELEASE_SHA" ]; then
   echo "Checked-out commit does not match the approved release SHA" >&2
   exit 1
 fi
@@ -140,7 +146,7 @@ assert_current_main() {
     echo "Canonical main moved after production approval; refusing stale deployment" >&2
     return 1
   fi
-  if [ "$RELEASE_MODE_VALUE" = "release" ] && [ "$current_main_sha" != "$RELEASE_SHA" ]; then
+  if [ "$EXACT_MAIN_RELEASE" = "1" ] && [ "$current_main_sha" != "$RELEASE_SHA" ]; then
     echo "Canonical main no longer matches the approved release SHA" >&2
     return 1
   fi
@@ -188,7 +194,7 @@ object_key=""
 package_sha=""
 package_checksum_b64=""
 
-if [ "$existing_version" = "0" ] || [ "$RELEASE_MODE_VALUE" = "release" ] || [ "$RELEASE_MODE_VALUE" = "focused-baseline" ]; then
+if [ "$existing_version" = "0" ] || [ "$EXACT_MAIN_RELEASE" = "1" ] || [ "$RELEASE_MODE_VALUE" = "focused-baseline" ]; then
   build_exact_tree_package
   validate_embedded_manifest "$package_path"
   package_sha=$(sha256_file "$package_path")
@@ -229,7 +235,7 @@ else
     echo "Existing application version source bundle is unavailable or outside the controlled bucket" >&2
     exit 1
   fi
-  if [ "$RELEASE_MODE_VALUE" = "release" ] || [ "$RELEASE_MODE_VALUE" = "focused-baseline" ]; then
+  if [ "$EXACT_MAIN_RELEASE" = "1" ] || [ "$RELEASE_MODE_VALUE" = "focused-baseline" ]; then
     expected_key="mosaic-releases/$RELEASE_SHA/$package_sha.zip"
     if [ "$object_key" != "$expected_key" ]; then
       echo "Existing application version does not reference this exact deterministic package" >&2
