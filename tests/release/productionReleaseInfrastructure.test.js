@@ -520,6 +520,38 @@ test('AWS topology collection validates the bare array the CLI --query projectio
   }
 });
 
+test('topology validator stays fail-closed for malformed configuration in either response shape', () => {
+  const cfg = topologyFixture().configuration.ConfigurationSettings[0];
+  const withoutSystemType = {
+    ...cfg,
+    OptionSettings: cfg.OptionSettings.filter((option) => option.OptionName !== 'SystemType'),
+  };
+  const cases = [
+    [[], /ConfigurationSettings must contain exactly one item/],
+    [[cfg, cfg], /ConfigurationSettings must contain exactly one item/],
+    [[{ ...cfg, EnvironmentName: 'other-env' }], /belongs to a different target/],
+    [[{ ...cfg, ApplicationName: 'other-app' }], /belongs to a different target/],
+    [[withoutSystemType], /SystemType is unavailable/],
+  ];
+  for (const [settings, expected] of cases) {
+    for (const wrap of [(value) => value, (value) => ({ ConfigurationSettings: value })]) {
+      const payload = topologyFixture();
+      payload.configuration = wrap(structuredClone(settings));
+      for (const mode of ['preflight', 'verify']) {
+        assert.throws(() => topologyApi.validateTopology(payload, topologyOptions(mode)), expected);
+      }
+    }
+  }
+  for (const malformed of [null, {}, { ConfigurationSettings: cfg }]) {
+    const payload = topologyFixture();
+    payload.configuration = malformed;
+    assert.throws(
+      () => topologyApi.validateTopology(payload, topologyOptions()),
+      /ConfigurationSettings must contain exactly one item/
+    );
+  }
+});
+
 test('two pinned gate rules transition idempotently and retain exact POST/path/503 shape', () => {
   const client = gateApi.createFixtureGateClient(gateFixture());
   const enabled = gateApi.transitionGate(client, 'active', gateConfig());
