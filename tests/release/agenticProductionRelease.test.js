@@ -1125,6 +1125,26 @@ test('focused deploy validates approved baseline and protected ref before AWS ac
   assert.doesNotMatch(result.stderr, /this-command-must-never-be-called/);
 });
 
+test('legacy-retirement bootstrap deploy is admitted and gets exact-main release guards before AWS access', () => {
+  const env = 'AWS_REGION=us-east-1 EB_APPLICATION_NAME=app EB_ENVIRONMENT_NAME=env EB_RELEASE_BUCKET=bucket AWS_CLI=this-command-must-never-be-called';
+  const notHead = '0'.repeat(40);
+  const result = spawnSync('bash', ['-c', `RELEASE_MODE=legacy-retirement-bootstrap ${env} bash scripts/release/deploy-eb-exact-sha.sh ${notHead}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stderr, /RELEASE_MODE must be/);
+  assert.match(result.stderr, /Checked-out commit does not match the approved release SHA/);
+  assert.doesNotMatch(result.stderr, /this-command-must-never-be-called/);
+
+  const unknown = spawnSync('bash', ['-c', `RELEASE_MODE=bootstrap ${env} bash scripts/release/deploy-eb-exact-sha.sh ${notHead}`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  assert.equal(unknown.status, 2);
+  assert.match(unknown.stderr, /RELEASE_MODE must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/);
+});
+
 test('timeout after update remains a blocked attempted but unverified deployment', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mosaic-release-evidence-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
