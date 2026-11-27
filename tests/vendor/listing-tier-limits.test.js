@@ -8,7 +8,7 @@ const {
   resolveProductListingLimit,
 } = require('../../utils/listingTierLimits');
 
-test('countProductListingUsage sums products and variants', async () => {
+test('countProductListingUsage counts products only; variants never use a slot (#514)', async () => {
   const Product = {
     countDocuments: async () => 2,
   };
@@ -24,7 +24,7 @@ test('countProductListingUsage sums products and variants', async () => {
 
   assert.equal(usage.productCount, 2);
   assert.equal(usage.variantCount, 5);
-  assert.equal(usage.total, 7);
+  assert.equal(usage.total, 2);
 });
 
 test('assertProductListingQuota allows when under limit', () => {
@@ -36,7 +36,7 @@ test('assertProductListingQuota blocks when at limit with zero remaining', () =>
   const result = assertProductListingQuota({ total: 10, incomingCount: 1, limit: 10 });
   assert.equal(result.ok, false);
   assert.equal(result.status, 403);
-  assert.match(result.error, /allows 10 total product\/variant entries/);
+  assert.match(result.error, /allows 10 products/);
 });
 
 test('assertProductListingQuota reports remaining slots', () => {

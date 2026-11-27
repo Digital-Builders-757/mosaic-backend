@@ -224,6 +224,12 @@ separate controlled prerequisite that:
 4. proves there are no outstanding payable legacy intents before certifying the
    canonical route as exclusive.
 
+The controlled bootstrap is the reviewed, one-time workflow mode
+`legacy-retirement-bootstrap` described in
+[`LEGACY_RETIREMENT_BOOTSTRAP.md`](LEGACY_RETIREMENT_BOOTSTRAP.md). It runs
+inside `Mosaic Production Release`, requires the same `production-release-control`
+approval, and is only admissible while `LEGACY_PAYMENT_RETIREMENT_SHA` is unset.
+
 After that controlled bootstrap is complete, set the non-secret repository
 variable `LEGACY_PAYMENT_RETIREMENT_SHA` to the full exact SHA observed on the
 production health/build surfaces and set
@@ -406,7 +412,11 @@ without migrating or overwriting it, and still requires the same pinned bucket.
 Focused-baseline S3 bundles use `--process`. The release-control role permits
 the required embedded-extension cache reads and writes on the environment
 specific prefix, so focused versions must reach `Processed` before deployment.
-This path rejects `env.yaml` and validates the exact Git bundle (including the+existing `.ebextensions/` and `.platform/` prohibition). A `Failed` or+`Unprocessed` focused version remains fatal. Historical rollback compatibility+may still explicitly accept an existing `Unprocessed` version after validating+its source bundle; normal release behavior is unchanged.
+This path rejects `env.yaml` and validates the exact Git bundle (including the
++existing `.ebextensions/` and `.platform/` prohibition). A `Failed` or
++`Unprocessed` focused version remains fatal. Historical rollback compatibility
++may still explicitly accept an existing `Unprocessed` version after validating
++its source bundle; normal release behavior is unchanged.
 
 ## `DescribeConfigurationSettings` secret-read caveat
 

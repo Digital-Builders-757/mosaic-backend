@@ -48,6 +48,10 @@ function isUnlimitedListingLimit(limit) {
   return !Number.isFinite(limit) || limit === Number.POSITIVE_INFINITY;
 }
 
+// Listing-slot rule (owner decision #514, 2026-11-23): one product uses one
+// slot. Its variants (size, color, ...) never count, and a product with no
+// options uses one slot even though it stores one default variant.
+// variantCount is still reported for diagnostics only.
 async function countProductListingUsage({ Product, ProductVariant, businessId }) {
   const [productCount, variantCount] = await Promise.all([
     Product.countDocuments({ businessId, isDeleted: false }),
@@ -57,7 +61,7 @@ async function countProductListingUsage({ Product, ProductVariant, businessId })
   return {
     productCount,
     variantCount,
-    total: productCount + variantCount,
+    total: productCount,
   };
 }
 
@@ -77,8 +81,8 @@ function assertProductListingQuota({ total, incomingCount, limit }) {
       status: 403,
       error:
         remaining === 0
-          ? `Product listing limit reached. Your plan allows ${safeLimit} total product/variant entries.`
-          : `Product listing limit reached. You can add only ${remaining} more product/variant entries.`,
+          ? `Product listing limit reached. Your plan allows ${safeLimit} products.`
+          : `Product listing limit reached. You can add only ${remaining} more products.`,
     };
   }
 

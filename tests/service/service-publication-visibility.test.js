@@ -52,9 +52,11 @@ function buildServiceDoc(overrides = {}) {
 function loadServiceController(options = {}) {
   const {
     existingService = null,
-    business = { _id: businessId, owner: ownerId, isActive: true, minorityType: 'none' },
+    business = { _id: businessId, owner: ownerId, isActive: true, minorityType: 'none', listingType: 'service' },
     subscription = { subscriptionPlanId: 'plan-1', status: 'active' },
     serviceLimit = 10,
+    sessionLog = [],
+    deletedImages = [],
   } = options;
 
   const savedDocs = [];
@@ -62,10 +64,10 @@ function loadServiceController(options = {}) {
 
   const Service = {
     startSession: async () => ({
-      startTransaction: () => {},
-      commitTransaction: async () => {},
-      abortTransaction: async () => {},
-      endSession: () => {},
+      startTransaction: () => { sessionLog.push('start'); },
+      commitTransaction: async () => { sessionLog.push('commit'); },
+      abortTransaction: async () => { sessionLog.push('abort'); },
+      endSession: () => { sessionLog.push('end'); },
     }),
     findOne: async (query) => {
       if (query._id === serviceId || (query.businessId && query.ownerId)) {
@@ -152,11 +154,13 @@ function loadServiceController(options = {}) {
     }
     if (request.endsWith('models/Business')) {
       return {
+        // Awaitable directly (create controllers) and via .select() (others).
         findOne: () => ({
           select: () => ({
             exec: async () => business,
             then: (resolve, reject) => Promise.resolve(business).then(resolve, reject),
           }),
+          then: (resolve, reject) => Promise.resolve(business).then(resolve, reject),
         }),
         find: () => ({
           select: () => ({
@@ -181,7 +185,7 @@ function loadServiceController(options = {}) {
     if (request.endsWith('models/PendingImage')) {
       return { deleteMany: async () => {}, deleteOne: async () => {} };
     }
-    if (request.endsWith('utils/deleteCloudinaryFile')) return async () => {};
+    if (request.endsWith('utils/deleteCloudinaryFile')) return async (url) => { deletedImages.push(url); };
     if (request.endsWith('@aws-sdk/client-s3')) return awsMocks();
     if (request.endsWith('@aws-sdk/s3-request-presigner')) return { getSignedUrl: async () => 'url' };
     if (request.endsWith('models/ServiceCategory')) return {};
@@ -657,4 +661,63 @@ test('createParentService persists faq, amenities, and normalized business hours
   assert.deepEqual(savedDocs[0].faq, [{ question: 'Q', answer: 'A' }]);
   assert.deepEqual(savedDocs[0].amenities, [{ label: 'Parking', available: false }]);
   assert.deepEqual(savedDocs[0].businessHours, [{ day: 'Friday', hours: '08:00-16:00', closed: false }]);
+});
+
+const createBody = {
+  businessId,
+  categoryId: '507f1f77bcf86cd799439014',
+  subcategoryId: '507f1f77bcf86cd799439015',
+  title: 'Hair Styling',
+  services: [{ name: 'Cut', price: 45, durationMinutes: 60 }],
+};
+
+test('service create ends its session exactly once on every exit path', async () => {
+  const cases = [
+    ['createService', 'existing listing (409)', { existingService: buildServiceDoc() }, 409, ['start', 'abort', 'end']],
+    ['createService', 'not the owner (403)', { business: null }, 403, ['start', 'abort', 'end']],
+    ['createService', 'wrong business type (403)', { business: { _id: businessId, owner: ownerId, isActive: true, listingType: 'product' } }, 403, ['start', 'abort', 'end']],
+    ['createParentService', 'not the owner (403)', { business: null }, 403, ['start', 'abort', 'end']],
+    ['createParentService', 'created (201)', { existingService: null }, 201, ['start', 'commit', 'end']],
+  ];
+  for (const [fn, label, options, status, expected] of cases) {
+    const sessionLog = [];
+    const { controller } = loadServiceController({ ...options, sessionLog });
+    const res = mockResponse();
+    await controller[fn]({ user: { _id: ownerId }, body: { ...createBody } }, res);
+    assert.equal(res.statusCode, status, `${fn} ${label}: ${JSON.stringify(res.body)}`);
+    assert.deepEqual(sessionLog, expected, `${fn} ${label}`);
+  }
+});
+
+test('an error after the service is saved keeps its images and returns 500, not 400', async () => {
+  const sessionLog = [];
+  const deletedImages = [];
+  const { controller, savedDocs } = loadServiceController({ existingService: null, sessionLog, deletedImages });
+  const res = mockResponse();
+  const okJson = res.json;
+  let failedOnce = false;
+  res.json = function json(payload) {
+    if (this.statusCode === 201 && !failedOnce) {
+      failedOnce = true;
+      throw new Error('serialisation failed');
+    }
+    return okJson.call(this, payload);
+  };
+
+  await controller.createService(
+    {
+      user: { _id: ownerId },
+      body: {
+        ...createBody,
+        coverImage: 'https://example.test/cover.webp',
+        images: ['https://example.test/g1.webp'],
+      },
+    },
+    res
+  );
+
+  assert.equal(savedDocs.length, 1);
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(deletedImages, []);
+  assert.deepEqual(sessionLog, ['start', 'commit', 'end']);
 });

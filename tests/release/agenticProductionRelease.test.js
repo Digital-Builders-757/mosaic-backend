@@ -1286,10 +1286,63 @@ test('checkout-gate CLI keeps normal release and its documented no-mode default'
 
 test('checkout-gate CLI keeps inherited rollback on the canonical gate path', () => {
   assert.equal(gateCli(gateEnableArgs, { RELEASE_MODE: 'rollback' }).releaseMode, 'release');
-  assert.throws(
-    () => gateCli([...gateVerifyArgs, '--release-mode', 'rollback'], { RELEASE_MODE: 'rollback' }),
-    /Unsupported checkout gate release mode/
+  assert.equal(gateCli(gateVerifyArgs, { RELEASE_MODE: 'rollback' }).releaseMode, 'release');
+});
+
+test('checkout-gate CLI maps an explicit rollback flag (as the workflow passes it) to the canonical gate', () => {
+  // The production workflow calls `manage-checkout-gate.js verify --release-mode "$RELEASE_MODE"`
+  // with RELEASE_MODE=rollback inherited from the job environment.
+  for (const args of [gateVerifyArgs, gateEnableArgs]) {
+    const explicitWithInherited = gateCli([...args, '--release-mode', 'rollback'], { RELEASE_MODE: 'rollback' });
+    assert.equal(explicitWithInherited.releaseMode, 'release');
+    assert.equal(gateCli([...args, '--release-mode', 'rollback']).releaseMode, 'release');
+  }
+  const verified = gateCli(
+    [...gateVerifyArgs, '--release-mode', 'rollback', '--expected-state', 'inactive'],
+    { RELEASE_MODE: 'rollback' }
   );
+  assert.equal(verified.releaseMode, 'release');
+  assert.equal(verified.expectedState, 'inactive');
+});
+
+test('explicit rollback cannot override or downgrade another inherited gate mode', () => {
+  for (const [flag, inherited] of [
+    ['rollback', 'release'],
+    ['rollback', 'focused-baseline'],
+    ['release', 'rollback'],
+    ['focused-baseline', 'rollback'],
+  ]) {
+    assert.throws(
+      () => gateCli([...gateVerifyArgs, '--release-mode', flag], { RELEASE_MODE: inherited }),
+      /--release-mode must match inherited RELEASE_MODE/
+    );
+  }
+  // Release and focused-baseline semantics are unchanged.
+  assert.equal(gateCli([...gateVerifyArgs, '--release-mode', 'release'], { RELEASE_MODE: 'release' }).releaseMode, 'release');
+  assert.equal(
+    gateCli([...gateVerifyArgs, '--release-mode', 'focused-baseline'], { RELEASE_MODE: 'focused-baseline' }).releaseMode,
+    'focused-baseline'
+  );
+  assert.throws(() => gateCli([...gateVerifyArgs, '--release-mode', 'unsupported']), /Unsupported checkout gate release mode/);
+  assert.throws(() => gateCli([...gateVerifyArgs, '--release-mode', 'Rollback']), /Unsupported checkout gate release mode/);
+});
+
+test('every approval-job gate tool call that forwards RELEASE_MODE accepts rollback', () => {
+  const workflow = fs.readFileSync(workflowPath, 'utf8');
+  const approvalJob = workflow.slice(
+    workflow.indexOf('  production-approval-and-release:'),
+    workflow.indexOf('  release-summary:')
+  );
+  const gateManagerCalls = approvalJob.match(/manage-checkout-gate\.js (?:verify|enable|disable) \\\n\s+--release-mode "\$RELEASE_MODE"/g) || [];
+  const gateVerifierCalls = approvalJob.match(/verify-checkout-gate\.sh(?: --state inactive)? \\\n\s+--release-mode "\$RELEASE_MODE"/g) || [];
+  assert.ok(gateManagerCalls.length >= 2, 'workflow forwards RELEASE_MODE to manage-checkout-gate.js');
+  assert.ok(gateVerifierCalls.length >= 4, 'workflow forwards RELEASE_MODE to verify-checkout-gate.sh');
+  for (const call of gateManagerCalls) {
+    const action = call.match(/manage-checkout-gate\.js (verify|enable|disable)/)[1];
+    const args = action === 'verify' ? gateVerifyArgs
+      : [action, '--confirm', action === 'enable' ? 'ENABLE_CHECKOUT_GATE' : 'DISABLE_CHECKOUT_GATE', '--output', 'gate-evidence.json'];
+    assert.equal(gateCli([...args, '--release-mode', 'rollback'], { RELEASE_MODE: 'rollback' }).releaseMode, 'release');
+  }
 });
 
 test('trusted controller supports historical rollback targets and fail-safe gate recovery', () => {

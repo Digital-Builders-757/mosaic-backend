@@ -104,7 +104,7 @@ const {
   restoreInventoryForOrder,
 } = require("../lib/inventory/orderInventory");
 const { claimOrderTransition, releaseOrderTransition, TRANSITION_CONFLICT_RESPONSE } = require("../lib/orders/orderTransitionLock");
-const { getBusinessCheckoutBlock } = require("../utils/checkoutGuards");
+const { getBusinessCheckoutBlock, isPurchasableVariant } = require("../utils/checkoutGuards");
 const {
   sendOrderStatusEmail,
   sendOrderUpdateEmail,
@@ -694,16 +694,7 @@ exports.buyNowQuote = async (req, res) => {
         "productId"
       );
 
-      if (
-        !variant ||
-        !variant.productId ||
-        !variant.productId.isPublished ||
-        !variant.productId.isActive ||
-        variant.productId.isDeleted ||
-        !variant.isPublished ||
-        variant.isDeleted ||
-        variant.productId._id.toString() !== productId
-      ) {
+      if (!isPurchasableVariant(variant, productId)) {
         return res.status(404).json({
           success: false,
           message: "Product not found",
@@ -874,11 +865,7 @@ exports.initiateOrder = async (req, res) => {
         "productId"
       );
 
-      if (
-        !variant ||
-        !variant.productId ||
-        variant.productId._id.toString() !== productId
-      ) {
+      if (!isPurchasableVariant(variant, productId)) {
         return res.status(404).json({
           success: false,
           message: "Product or variant not found",

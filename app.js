@@ -61,8 +61,8 @@ const bookingRoutes = require('./routes/bookingRoutes')
 
 
 
-// Import Payment and Order Routes
-const paymentRoutes = require('./routes/paymentRoutes');
+// Import Order Routes. The legacy client-driven payment-intent router is retired;
+// checkout initiation is exclusive to the canonical order routes below.
 const orderRoutes = require('./routes/orderRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 
@@ -94,6 +94,7 @@ const requestIdMiddleware = require('./middlewares/requestId');
 const { isSentryEnabled } = require('./instrument');
 const { getAllowedOrigins, isAllowedCredentialOrigin } = require('./utils/corsOrigins');
 const { resolveTrustProxyHops } = require('./utils/trustProxy');
+const { installCatalogMediaProxy } = require('./lib/media/catalogMediaProxy');
 
 const app = express();
 
@@ -136,6 +137,8 @@ app.use('/api/subscription/webhook',
   handleSubscriptionWebhook
 );
 app.use(express.json({ limit: '1mb' }));
+// Staging-only catalog media proxy (MBH-055). Installs nothing unless MEDIA_PROXY_MODE=staging on a staging release.
+installCatalogMediaProxy(app);
 // Express 5 makes req.query read-only; sanitize body/params only (query uses Mongoose/validators).
 app.use((req, res, next) => {
   if (req.body && typeof req.body === 'object') {
@@ -222,7 +225,6 @@ app.use('/api/cart', cartRoutes);
 
 
 
-app.use('/api/payments', paymentRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/bookings', bookingRoutes)
 const vendorAlertsRoutes = require('./routes/vendorAlertsRoutes');

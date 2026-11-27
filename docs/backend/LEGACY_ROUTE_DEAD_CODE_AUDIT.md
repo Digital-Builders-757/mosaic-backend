@@ -62,7 +62,7 @@ Cleanup order:
 | --- | --- |
 | `/api/featured-products` | Canonical public featured product route. |
 | `/api/products/featured` | Must stay absent. Existing contract tests guard this. |
-| `/api/payments/create-payment-intent` | Legacy but guarded. Keep until checkout caller inventory is complete. |
+| `/api/payments/create-payment-intent` | Retired 2026-11-24 (no frontend caller; router and controller deleted). |
 | `/api/orders/initiate` | Canonical customer checkout initiation path. |
 
 ## Files Not Safe To Delete Yet

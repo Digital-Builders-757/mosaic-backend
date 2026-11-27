@@ -125,12 +125,17 @@ async function updateVariant(user, productId, variantId, body) {
 }
 
 // Records every S3 DeleteObject and the stored cover at the moment it is sent.
-function recordS3Deletes(t, productId, variantId) {
+// With `withPrice`, also records the stored product.price at delete time.
+function recordS3Deletes(t, productId, variantId, { withPrice = false } = {}) {
   const deletes = [];
   t.mock.method(S3Client.prototype, 'send', async (command) => {
     assert.ok(command instanceof DeleteObjectCommand, 'only deletes are expected');
     const entry = { key: command.input.Key, bucket: command.input.Bucket };
-    if (productId) entry.storedCover = (await Product.findById(productId).lean())?.coverImage;
+    if (productId) {
+      const storedProduct = await Product.findById(productId).lean();
+      entry.storedCover = storedProduct?.coverImage;
+      if (withPrice) entry.storedPrice = storedProduct?.price == null ? null : String(storedProduct.price);
+    }
     if (variantId) entry.storedImages = (await ProductVariant.findById(variantId).lean())?.images;
     deletes.push(entry);
     return {};
@@ -295,6 +300,7 @@ test('malformed variants payloads are rejected before any write', async (t) => {
   for (const [variants, code] of [
     [[line(), line()], 'PRODUCT_VARIANT_INVALID'], // duplicate _id
     [[line({ _id: 'not-an-object-id' })], 'PRODUCT_VARIANT_INVALID'],
+    [[line({ _id: 123 })], 'PRODUCT_VARIANT_INVALID'], // ObjectId.isValid accepts numbers
     [[null], 'PRODUCT_VALIDATION_FAILED'],
     [['variant'], 'PRODUCT_VALIDATION_FAILED'],
     [[[line()]], 'PRODUCT_VALIDATION_FAILED'],
@@ -371,4 +377,89 @@ test('an updateVariant save failure deletes nothing', async (t) => {
   assert.equal(res.statusCode, 500);
   assert.deepEqual(deletes, []);
   assert.deepEqual((await ProductVariant.findById(stored._id).lean()).images, [ownImage]);
+});
+
+// Combined #364 + #457 behavior on one product: the price summary uses the
+// listing policy's effective price (sale if > 0, else base if > 0, skipping
+// soft-deleted variants), so a $0 sale price never becomes the card price.
+test('combined: edit-modal publish with salePrice 0 prices from base, cover delete after save, no-variants publish keeps both', async (t) => {
+  const { user, business } = await seedVendor();
+  const oldCover = ownUrl(user, 'combined-old');
+  const newCover = ownUrl(user, 'combined-new');
+  const product = await createProduct(user, business, {
+    coverImage: oldCover,
+    variants: [variant('COMBO-1', 20, 'M'), variant('COMBO-2', 30, 'L')],
+  });
+  const deletes = recordS3Deletes(t, product._id, null, { withPrice: true });
+
+  // Edit modal payload: every variant with its _id and salePrice 0, publishing, new cover.
+  const stored = await ProductVariant.find({ productId: product._id }).lean();
+  const published = await updateProduct(user, product._id, {
+    title: 'Combined',
+    coverImage: newCover,
+    isPublished: true,
+    variants: stored.map((v) => ({
+      _id: String(v._id),
+      sku: v.sku,
+      attributes: v.attributes,
+      price: Number(v.price.toString()),
+      salePrice: 0,
+      stock: v.stock,
+    })),
+  });
+  assert.equal(published.statusCode, 200, JSON.stringify(published.body));
+  const afterPublish = await Product.findById(product._id).lean();
+  assert.equal(afterPublish.isPublished, true);
+  assert.equal(String(afterPublish.price), '20', 'salePrice 0 falls back to the $20 base price');
+  assert.deepEqual(deletes, [{
+    key: `products/${user._id}/covers/1700000000000-combined-old.webp`,
+    bucket: BUCKET,
+    storedCover: newCover, // deleted only after the new cover was saved
+    storedPrice: '20', // ...and after the final save that wrote the price summary
+  }]);
+
+  // Publish PUT without a variants array: variants and price are untouched.
+  deletes.length = 0;
+  const variantsBefore = await ProductVariant.find({ productId: product._id }).sort({ sku: 1 }).lean();
+  const again = await updateProduct(user, product._id, { title: 'Combined again', isPublished: true });
+  assert.equal(again.statusCode, 200, JSON.stringify(again.body));
+  const variantsAfter = await ProductVariant.find({ productId: product._id }).sort({ sku: 1 }).lean();
+  assert.deepEqual(
+    variantsAfter.map((v) => [String(v._id), String(v.price), String(v.salePrice), v.isDeleted === true]),
+    variantsBefore.map((v) => [String(v._id), String(v.price), String(v.salePrice), v.isDeleted === true]),
+  );
+  assert.equal(variantsAfter.length, 2);
+  assert.equal(String((await Product.findById(product._id)).price), '20');
+  assert.deepEqual(deletes, [], 'no cover change, no delete');
+});
+
+test('a variant save failure mid-update refreshes product.price from the surviving variants', async (t) => {
+  const { user, business } = await seedVendor();
+  const product = await createProduct(user, business, {
+    coverImage: ownUrl(user, 'cover'),
+    variants: [variant('MID-A', 20, 'M'), variant('MID-B', 10, 'L')],
+  });
+  assert.equal(String((await Product.findById(product._id)).price), '10');
+  const [a] = await ProductVariant.find({ productId: product._id, sku: /MID-A$/ });
+
+  // B is dropped by deleteMany, A saves at $50, then the new variant's save throws.
+  const originalSave = ProductVariant.prototype.save;
+  let saves = 0;
+  t.mock.method(ProductVariant.prototype, 'save', async function save(...args) {
+    saves += 1;
+    if (saves === 2) throw new Error('synthetic variant save failure');
+    return originalSave.apply(this, args);
+  });
+
+  const res = await updateProduct(user, product._id, {
+    variants: [
+      { _id: String(a._id), attributes: { Size: 'M' }, price: 50, stock: 2 },
+      { attributes: { Size: 'S' }, sku: 'MID-C', price: 7, stock: 2 },
+    ],
+  });
+
+  assert.equal(res.statusCode, 500);
+  const surviving = await ProductVariant.find({ productId: product._id, isDeleted: { $ne: true } }).lean();
+  assert.deepEqual(surviving.map((v) => String(v.price)), ['50']);
+  assert.equal(String((await Product.findById(product._id)).price), '50');
 });

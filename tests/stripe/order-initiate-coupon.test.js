@@ -46,6 +46,8 @@ function buildVariant(overrides = {}) {
     sku: 'SKU-TEST',
     stock: overrides.stock ?? 10,
     allowBackorder: false,
+    isPublished: true,
+    isDeleted: false,
     sizes: [
       {
         size: 'M',
@@ -58,6 +60,9 @@ function buildVariant(overrides = {}) {
     productId: {
       _id: { toString: () => productId },
       title: 'Test Product',
+      isPublished: true,
+      isActive: true,
+      isDeleted: false,
       ...(overrides.productId || {}),
     },
     ...overrides.variantExtra,

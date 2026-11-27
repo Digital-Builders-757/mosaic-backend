@@ -11,6 +11,10 @@ const FOCUSED_CHANGED_FILES = [
   { status: 'A', file: 'tests/vendor/vendor-booking-type-filter.test.js' },
 ];
 
+// keep-closed: the release finishes with the checkout gate verified active.
+// open: the gate is removed after the verified deploy (normal checkout).
+const CHECKOUT_POLICIES = Object.freeze(['keep-closed', 'open']);
+
 function parseArgs(argv) {
   const values = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -21,8 +25,12 @@ function parseArgs(argv) {
   }
   if (!values.directory || !values.output || !FULL_SHA.test(values['release-sha'] || '')
       || !['success', 'failure', 'cancelled'].includes(values['job-status'])
-      || (values['release-mode'] && !['release', 'rollback', 'focused-baseline', 'unknown'].includes(values['release-mode']))) {
+      || (values['release-mode'] && !['release', 'rollback', 'focused-baseline', 'legacy-retirement-bootstrap', 'unknown'].includes(values['release-mode']))) {
     throw new Error('Directory, output, full release SHA, and job status are required');
+  }
+  if (values['checkout-after-release'] !== undefined
+      && !CHECKOUT_POLICIES.includes(values['checkout-after-release'])) {
+    throw new Error('--checkout-after-release must be keep-closed or open');
   }
   return values;
 }
@@ -221,6 +229,10 @@ function deriveFailurePhase(state, jobStatus) {
   if (!state.reservationsAfterZero) return 'post-deploy-reservations';
   if (state.focusedBaseline) {
     if (!state.gate.finalStateVerified || state.gate.finalState !== 'active') return 'checkout-gate-remain-active';
+  } else if (state.keepClosed) {
+    if (!state.narrowPassed) return 'checkout-gate-narrow';
+    if (!state.gate.finalStateVerified || state.gate.finalState !== 'active'
+        || state.gateDisableRecorded || !state.publicKeptClosedPassed) return 'checkout-gate-kept-closed';
   } else if (!state.gate.finalStateVerified || state.gate.finalState !== 'inactive'
       || !state.publicUngatedPassed) {
     return 'checkout-ungate';
@@ -229,7 +241,10 @@ function deriveFailurePhase(state, jobStatus) {
 }
 
 function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
-  releaseMode: releaseModeOverride, now = new Date() }) {
+  releaseMode: releaseModeOverride, checkoutAfterRelease = 'open', now = new Date() }) {
+  if (!CHECKOUT_POLICIES.includes(checkoutAfterRelease)) {
+    throw new Error('checkoutAfterRelease must be keep-closed or open');
+  }
   const normalizedSha = releaseSha.toLowerCase();
   const files = {
     releaseIdentity: readOptionalJson(directory, 'release-identity.json'),
@@ -252,6 +267,8 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     gateFinal: readOptionalJson(directory, 'gate-final.json'),
     gateFailureSafe: readOptionalJson(directory, 'gate-failure-safe.json'),
     publicUngated: readOptionalJson(directory, 'public-ungated.json'),
+    gateNarrowed: readOptionalJson(directory, 'gate-narrowed.json'),
+    publicKeptClosed: readOptionalJson(directory, 'public-kept-closed.json'),
   };
 
   const gate = deriveGateState(files);
@@ -293,6 +310,15 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
   const publicUngatedPassed = exactReleaseEvidence(files.publicUngated, normalizedSha)
     && files.publicUngated.observedSha === normalizedSha;
   const postDeploymentPassed = awsDeployedPassed && publicDeployedPassed;
+  const keepClosed = !focusedBaseline && checkoutAfterRelease === 'keep-closed';
+  // Kept closed: exact SHA on the public surface, the retired legacy route
+  // answering 404/405 from the application, no disable attempted, and the
+  // final gate read back active. A bootstrap must also have narrowed its gate.
+  const publicKeptClosedPassed = exactReleaseEvidence(files.publicKeptClosed, normalizedSha)
+    && files.publicKeptClosed.observedSha === normalizedSha
+    && [404, 405].includes(files.publicKeptClosed.legacyPaymentStatus);
+  const narrowPassed = releaseMode !== 'legacy-retirement-bootstrap'
+    || (files.gateNarrowed?.status === 'passed' && files.gateNarrowed?.gateState === 'active');
 
   // Reaching and passing the approved topology step is workflow-DAG evidence
   // that all required preapproval jobs succeeded before the protected
@@ -331,7 +357,10 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
   const preApprovalFailurePhase = workflowPreApproval?.failurePhase || null;
   const finalGatePassed = focusedBaseline
     ? gate.finalStateVerified && gate.finalState === 'active'
-    : gate.finalStateVerified && gate.finalState === 'inactive' && publicUngatedPassed;
+    : keepClosed
+      ? gate.finalStateVerified && gate.finalState === 'active' && !files.gateDisabled
+        && !gate.failureSafeAttempted && narrowPassed && publicKeptClosedPassed
+      : gate.finalStateVerified && gate.finalState === 'inactive' && publicUngatedPassed;
   const releaseSafetyComplete = Boolean(
     preApprovalPassed
     && gate.activationVerified
@@ -355,6 +384,10 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     publicUngatedPassed,
     releaseSafetyComplete,
     focusedBaseline,
+    keepClosed,
+    gateDisableRecorded: Boolean(files.gateDisabled),
+    narrowPassed,
+    publicKeptClosedPassed,
   };
   const productionMutation = gate.attempted || deployment.attempted;
   const failurePhase = focusedBaseline && !productionMutation
@@ -374,6 +407,7 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
     repository: process.env.GITHUB_REPOSITORY || 'Techware-Hut/mosaic-backend',
     releaseMode,
     releaseSha: normalizedSha,
+    checkoutAfterRelease: focusedBaseline ? 'keep-closed' : checkoutAfterRelease,
     focusedBaseline: focusedBaseline ? {
       baselineSha: focusedSource?.baselineSha || null,
       releaseRef: focusedSource?.releaseRef || null,
@@ -479,11 +513,13 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
       drainSeconds: files.drain?.drainSeconds ?? null,
       removal: focusedBaseline && gate.finalState === 'active'
         ? 'focused-gate-remained-active'
+        : keepClosed && gate.finalState === 'active'
+          ? 'kept-closed-by-policy'
         : files.gateDisabled?.status === 'passed' ? 'transition-verified' : 'not-verified',
       finalState: gate.finalState,
       finalStateVerified: gate.finalStateVerified,
       safetyAssumption: gate.checkoutGate === 'UNKNOWN_TREAT_ACTIVE' ? 'treat-active' : null,
-      normalCheckoutRestored: focusedBaseline
+      normalCheckoutRestored: focusedBaseline || keepClosed
         ? false
         : publicUngatedPassed && gate.finalState === 'inactive',
     },
@@ -503,7 +539,8 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
         ? focusedPublicProof ? 'success' : 'not-complete'
         : files.publicPreflight ? 'success' : preApprovalPassed ? 'success-by-job-reachability' : 'not-complete',
       deployed: publicDeployedPassed ? 'success' : 'not-complete',
-      ungated: publicUngatedPassed ? 'success' : 'not-complete',
+      ungated: keepClosed ? 'not-run-kept-closed' : publicUngatedPassed ? 'success' : 'not-complete',
+      keptClosed: keepClosed ? (publicKeptClosedPassed ? 'success' : 'not-complete') : 'not-applicable',
     },
     nextAction: focusedBaseline && !productionMutation
       ? focusedPreflightPassed
@@ -512,8 +549,10 @@ function buildProductionEvidence({ directory, releaseSha, jobStatus, runUrl,
       : released
       ? focusedBaseline
         ? 'Perform focused dashboard UAT while checkout remains gated; request a separately authorized ungate only after acceptance.'
-        : 'Perform the issue-specific production UAT checklist.'
-      : gate.finalState !== 'inactive' || !gate.finalStateVerified
+        : keepClosed
+          ? 'Release verified with checkout kept closed; opening checkout is a separate, explicitly authorized action.'
+          : 'Perform the issue-specific production UAT checklist.'
+      : (keepClosed ? gate.finalState !== 'active' : gate.finalState !== 'inactive') || !gate.finalStateVerified
         ? 'Treat checkout as gated; inspect the failing phase and reconcile or rollback under break-glass control.'
         : deployment.attempted && !releaseSafetyComplete
           ? 'Reconcile the attempted deployment and rollback under break-glass control if the exact release cannot be proven healthy.'
@@ -529,6 +568,7 @@ function renderSummary(evidence) {
     '',
     `- Release SHA: \`${evidence.releaseSha}\``,
     `- Release mode: ${evidence.releaseMode}`,
+    `- Checkout after release: ${evidence.checkoutAfterRelease}`,
     ...(evidence.focusedBaseline ? [
       `- Production baseline SHA: ${evidence.focusedBaseline.baselineSha || 'unknown'}`,
       `- Protected focused ref: ${evidence.focusedBaseline.releaseRef || 'unknown'}`,
@@ -556,6 +596,7 @@ function main(argv = process.argv.slice(2)) {
     jobStatus: args['job-status'],
     runUrl: args['run-url'],
     releaseMode: args['release-mode'],
+    checkoutAfterRelease: args['checkout-after-release'] || 'open',
   });
   fs.mkdirSync(path.dirname(path.resolve(args.output)), { recursive: true });
   fs.writeFileSync(args.output, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });

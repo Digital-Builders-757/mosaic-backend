@@ -47,7 +47,6 @@ test('app.js mounts launch-critical route prefixes', () => {
     "app.use('/admin/users', adminUserRoutes)",
     "app.use('/admin/api/products', adminProductRoutes)",
     "app.use('/admin/api/orders', adminOrderRoutes)",
-    "app.use('/api/payments', paymentRoutes)",
     "app.use('/api/orders', orderRoutes)",
     "app.use('/api/connect', connectRoutes)",
     "app.use('/stripe', stripeNewRoutes)",
@@ -163,15 +162,12 @@ test('POST /api/orders/initiate requires authenticate and checkout-buyer role', 
   assert.match(source, /router\.post\('\/initiate', authenticate, isCheckoutBuyer, initiateOrder\)/);
 });
 
-// Legacy route: canonical checkout is POST /api/orders/initiate (Connect destination charge).
-test('POST /api/payments/create-payment-intent is legacy but guarded', () => {
-  const source = readSource(paymentRoutesPath);
-  const routeBlock = source.slice(source.indexOf("'/create-payment-intent'"));
-
-  assert.ok(routeBlock.includes('authenticate'));
-  assert.ok(routeBlock.includes('isCustomer'));
-  assert.ok(routeBlock.includes('paymentLimiter'));
-  assert.ok(routeBlock.indexOf('authenticate') < routeBlock.indexOf('createPaymentIntent'));
+// Legacy route retired: canonical checkout is POST /api/orders/initiate (Connect destination charge).
+test('legacy POST /api/payments/create-payment-intent is retired and unmounted', () => {
+  const source = readSource(appPath);
+  assert.ok(!fs.existsSync(paymentRoutesPath), 'legacy payment router must stay deleted');
+  assert.ok(!source.includes("app.use('/api/payments'"), 'legacy /api/payments mount must stay removed');
+  assert.ok(!source.includes('paymentRoutes'), 'app.js must not import the legacy payment router');
 });
 
 test('app.js keeps Stripe webhook raw-body mounts before express.json', () => {
@@ -238,7 +234,6 @@ test('documented launch paths resolve to expected registration status', () => {
     { label: '/admin/api/products', needle: "app.use('/admin/api/products'" },
     { label: '/admin/api/orders', needle: "app.use('/admin/api/orders'" },
     { label: '/api/orders/initiate', needle: "app.use('/api/orders'" },
-    { label: '/api/payments/create-payment-intent', needle: "app.use('/api/payments'" },
     { label: '/stripe/account-session', needle: "router.post('/account-session'" },
     { label: '/stripe/express-login-link', needle: "router.post('/express-login-link'" },
     { label: '/stripe/account-balance', needle: "router.get('/account-balance'" },
@@ -253,6 +248,7 @@ test('documented launch paths resolve to expected registration status', () => {
   const expectedAbsent = [
     "app.use('/api/admin/users'",
     "app.use('/api/stripe/account-session'",
+    "app.use('/api/payments'",
     '/api/products/featured',
   ];
 

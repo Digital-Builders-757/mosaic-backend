@@ -33,6 +33,12 @@ const {
   logUploadFailure,
 } = require('../utils/uploadDiagnostics');
 const { validateProductPublishState } = require('../lib/marketplace/listingPricePolicy');
+const {
+  summarizeVariantPrices,
+  recomputeProductPriceSummary,
+  recomputeProductPriceSummarySafe,
+} = require('../utils/productPriceSummary');
+const priceSummaryModels = { Product, ProductVariant };
 const { Decimal128 } = mongoose.Types;
 const s3Client = new S3Client(buildS3ClientConfig());
 const { toResponseSalePrice } = require('../lib/marketplace/listingPricePolicy');
@@ -239,6 +245,48 @@ const normalizeVariantPayload = (variant, options = {}) => {
   };
 };
 
+// Request publish flags: true / 'true' / 1 / '1' -> true,
+// false / 'false' / 0 / '0' -> false (the same inputs the routes' isBoolean
+// validators accept, so legacy clients keep their meaning); anything else
+// (missing, null, 'yes', ...) -> undefined ("not sent").
+const normalizePublishFlag = (value) => {
+  if (value === true || value === 'true' || value === 1 || value === '1') return true;
+  if (value === false || value === 'false' || value === 0 || value === '0') return false;
+  return undefined;
+};
+
+// Publication state for one variant in a product create/update. The variant's
+// own flag (the editor's per-variant Published / Draft choice, boolean or
+// 'true'/'false') wins; otherwise the product-level value applies, and when
+// that is absent too the variant keeps `fallback` (its stored state, or false
+// for a new variant).
+const resolveVariantPublished = (variant, productIsPublished, fallback) => {
+  const own = normalizePublishFlag(variant?.isPublished);
+  if (own !== undefined) return own;
+  if (productIsPublished !== undefined) return productIsPublished;
+  return fallback;
+};
+
+// Same rule as the publish check: a published product needs at least one live
+// (non-deleted, not Draft) variant with a usable price. `product: {}` so the
+// stored product.price is not used as a stand-in when no variant is live.
+const hasPricedLiveVariant = (variants) =>
+  validateProductPublishState({ product: {}, variants, isPublished: true }).ok;
+
+// Auto-unpublish a published product when, after a vendor's variant change,
+// no live variant has a usable price. Never rejects the vendor's action.
+// Returns true when the product was unpublished.
+const autoUnpublishIfNoPricedLiveVariant = async (product) => {
+  if (!product.isPublished) return false;
+  const remaining = await ProductVariant.find(
+    { productId: product._id, isDeleted: { $ne: true } },
+    'price salePrice isDeleted isPublished'
+  );
+  if (hasPricedLiveVariant(remaining)) return false;
+  product.isPublished = false;
+  return true;
+};
+
 const toDecimal128 = (value) => Decimal128.fromString(String(value));
 
 const toStockNumber = (value) => {
@@ -373,6 +421,14 @@ exports.createProductWithVariants = async (req, res) => {
     if (!business) {
       return res.status(403).json({ error: 'You do not own this business.' });
     }
+    // Goods listings belong to product businesses only; service and food
+    // businesses have their own listing types.
+    if (business.listingType !== 'product') {
+      return res.status(403).json({
+        code: 'PRODUCT_BUSINESS_TYPE_MISMATCH',
+        error: 'Only product businesses can create product listings. Choose a product business.',
+      });
+    }
 
     // Check subscription
     const subscription = await Subscription.findOne({
@@ -394,11 +450,11 @@ exports.createProductWithVariants = async (req, res) => {
     );
     const galleryImageLimit = getGalleryImageLimit(subscriptionPlan);
 
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
+    // One new product = one listing slot, however many variants it has (#514).
     const usage = await countProductListingUsage({ Product, ProductVariant, businessId });
     const quotaCheck = assertProductListingQuota({
       total: usage.total,
-      incomingCount: 1 + incomingVariantCount,
+      incomingCount: 1,
       limit: productLimit,
     });
 
@@ -413,7 +469,8 @@ exports.createProductWithVariants = async (req, res) => {
       });
     }
 
-    const willPublish = Boolean(isPublished);
+    // true/'true' publishes; false/'false'/missing/other values create a draft.
+    let willPublish = normalizePublishFlag(isPublished) === true;
 
     if (!Array.isArray(variants) || variants.length === 0) {
       return res.status(400).json({ code: 'PRODUCT_VALIDATION_FAILED', error: 'At least one variant is required.' });
@@ -508,9 +565,15 @@ for (const [index, variant] of variants.entries()) {
     stock: normalizedVariant.stock,
     shipping: normalizeVariantShipping(variant.shipping),
     images: variant.images || [],
-    isPublished: willPublish,
+    isPublished: resolveVariantPublished(variant, willPublish, false),
   });
 }
+
+    // Publishing with every variant in Draft creates the product unpublished
+    // (same rule as updateProduct), rather than an empty published listing.
+    if (willPublish && variantDocs.every((doc) => doc.isPublished !== true)) {
+      willPublish = false;
+    }
 
     if (willPublish) {
       const publishCheck = validateProductPublishState({
@@ -583,19 +646,11 @@ for (const [index, variant] of variants.entries()) {
       // -----------------------------
       // Update product price as minimum variant price
       // -----------------------------
-const prices = savedVariants.map(v => {
-  const sale = v.salePrice ? parseFloat(v.salePrice.toString()) : null;
-  const price = parseFloat(v.price.toString());
-
-  return sale !== null ? sale : price;
-});
-
-const minPrice = Math.min(...prices);
-const maxPrice = Math.max(...prices);
+const priceSummary = summarizeVariantPrices(savedVariants);
 
       await Product.findByIdAndUpdate(product._id, {
-        price: Decimal128.fromString(minPrice.toString()),
-        maxPrice: Decimal128.fromString(maxPrice.toString()),
+        price: priceSummary.price,
+        maxPrice: priceSummary.maxPrice,
         isPublished: willPublish,
       });
 
@@ -871,6 +926,9 @@ exports.getProductById = async (req, res) => {
  * UPDATE PRODUCT
  */
 exports.updateProduct = async (req, res) => {
+  // Set once a variant delete/save may have persisted, so the catch can
+  // refresh the product price summary from whatever variants remain.
+  let variantWritesStarted = false;
   try {
     const { productId } = req.params;
     const userId = req.user._id;
@@ -930,8 +988,16 @@ exports.updateProduct = async (req, res) => {
       });
     }
 
-    const nextPublished =
-      isPublished !== undefined ? isPublished : product.isPublished;
+    // Normalised once: true/'true', false/'false', else undefined (not sent).
+    const publishFlag = normalizePublishFlag(isPublished);
+    // An explicit publish request is rejected when it can't be honoured; a
+    // product that is published already and stays so implicitly is instead
+    // auto-unpublished when the edit leaves no priced live variant.
+    const publishRequested = publishFlag === true;
+    const wasPublished = product.isPublished === true;
+    let nextPublished =
+      publishFlag !== undefined ? publishFlag : product.isPublished;
+    let autoUnpublished = false;
 
     // Variants are only replaced when the request sends a `variants` array
     // (the edit modal always does). Validate everything before any write.
@@ -944,7 +1010,7 @@ exports.updateProduct = async (req, res) => {
           return res.status(400).json({ code: 'PRODUCT_VALIDATION_FAILED', error: 'Each variant must be an object.' });
         }
         if (variant._id) {
-          if (!mongoose.Types.ObjectId.isValid(variant._id)) {
+          if (!/^[0-9a-f]{24}$/i.test(String(variant._id))) {
             return res.status(400).json({ code: 'PRODUCT_VARIANT_INVALID', error: 'Invalid variant ID' });
           }
           const variantIdKey = String(variant._id);
@@ -976,7 +1042,7 @@ exports.updateProduct = async (req, res) => {
             candidateVariants.push({
               price: normalizedVariant.hasPrice ? normalizedVariant.price : existingVariant.price,
               salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : existingVariant.salePrice,
-              isPublished: isPublished !== undefined ? isPublished : existingVariant.isPublished,
+              isPublished: resolveVariantPublished(variant, publishFlag, existingVariant.isPublished),
               // The loop below keeps isDeleted as stored; the publish rule ignores deleted variants.
               isDeleted: existingVariant.isDeleted,
             });
@@ -984,22 +1050,45 @@ exports.updateProduct = async (req, res) => {
             candidateVariants.push({
               price: normalizedVariant.price,
               salePrice: normalizedVariant.hasSalePrice ? normalizedVariant.salePrice : null,
-              isPublished: isPublished || false,
+              isPublished: resolveVariantPublished(variant, publishFlag || false, false),
             });
           }
         });
       }
-      const publishPreCheck = validateProductPublishState({
-        product,
-        variants: candidateVariants,
-        isPublished: true,
-      });
-      if (!publishPreCheck.ok) {
-        return res.status(400).json({
-          error: publishPreCheck.message,
-          code: publishPreCheck.code,
+
+      // The vendor's variants payload marks every remaining variant Draft:
+      // unpublish the product instead of publishing an empty listing (#386
+      // rule; "Draft" = isPublished false, as in the publish check).
+      const nonDeletedCandidates = candidateVariants.filter((v) => v.isDeleted !== true);
+      const allCandidatesDraft =
+        hasVariantPayload &&
+        nonDeletedCandidates.length > 0 &&
+        nonDeletedCandidates.every((v) => v.isPublished === false);
+
+      if (allCandidatesDraft) {
+        nextPublished = false;
+      } else {
+        // Needs a live candidate with a usable price. `product: {}` so the
+        // stored product.price (possibly a Draft fallback) never stands in
+        // when no variant is live, e.g. no `variants` payload on an all-Draft
+        // product, or `variants: []`.
+        const publishPreCheck = validateProductPublishState({
+          product: {},
+          variants: candidateVariants,
+          isPublished: true,
         });
+        if (!publishPreCheck.ok) {
+          if (publishRequested) {
+            return res.status(400).json({
+              error: publishPreCheck.message,
+              code: publishPreCheck.code,
+            });
+          }
+          // Not a publish request: keep the vendor's edit, unpublish instead.
+          nextPublished = false;
+        }
       }
+      autoUnpublished = wasPublished && !nextPublished;
     }
 
     // The old cover is removed from storage only after the product is saved.
@@ -1038,6 +1127,7 @@ exports.updateProduct = async (req, res) => {
       const frontendVariantIds = variants.filter(v => v._id).map(v => v._id.toString());
 
       // Remove variants not in frontend payload
+      variantWritesStarted = true;
       await ProductVariant.deleteMany({
         productId,
         _id: { $nin: frontendVariantIds }
@@ -1070,8 +1160,11 @@ exports.updateProduct = async (req, res) => {
               existingVariant.shipping
             );
             existingVariant.images = variant.images || [];
-            existingVariant.isPublished =
-              isPublished !== undefined ? isPublished : existingVariant.isPublished;
+            existingVariant.isPublished = resolveVariantPublished(
+              variant,
+              publishFlag,
+              existingVariant.isPublished
+            );
 
             await existingVariant.save();
             savedVariants.push(existingVariant);
@@ -1108,7 +1201,7 @@ exports.updateProduct = async (req, res) => {
             stock: normalizedVariant.stock,
             shipping: normalizeVariantShipping(variant.shipping),
             images: variant.images || [],
-            isPublished: isPublished || false
+            isPublished: resolveVariantPublished(variant, publishFlag || false, false)
           });
 
           await newVariant.save();
@@ -1118,6 +1211,7 @@ exports.updateProduct = async (req, res) => {
     } else if (hasVariantPayload) {
       // An explicit empty variants array removes all variants. A request
       // without a variants array leaves the existing variants untouched.
+      variantWritesStarted = true;
       await ProductVariant.deleteMany({ productId });
     }
 
@@ -1127,40 +1221,34 @@ exports.updateProduct = async (req, res) => {
     const allVariants = await ProductVariant.find({ productId });
 
     if (nextPublished) {
+      // Same rule as the pre-check: stored product.price is never a stand-in.
       const publishCheck = validateProductPublishState({
-        product,
+        product: {},
         variants: allVariants,
         isPublished: true,
       });
       if (!publishCheck.ok) {
-        return res.status(400).json({
-          error: publishCheck.message,
-          code: publishCheck.code,
-        });
+        if (publishRequested) {
+          // Variant deletes/saves above already persisted.
+          await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
+          return res.status(400).json({
+            error: publishCheck.message,
+            code: publishCheck.code,
+          });
+        }
+        // Not a publish request: the edit stands, the product is unpublished.
+        nextPublished = false;
+        autoUnpublished = wasPublished;
       }
     }
 
     product.isPublished = nextPublished;
 
-    if (allVariants.length > 0) {
-      const prices = allVariants.map(v => {
-        const sale = v.salePrice ? parseFloat(v.salePrice.toString()) : null;
-        const price = parseFloat(v.price.toString());
-        return sale ?? price; // salePrice has priority
-      });
-
-      const minPrice = Math.min(...prices);
-      const maxPrice = Math.max(...prices);
-
-      product.price = Decimal128.fromString(minPrice.toString());
-      product.maxPrice = Decimal128.fromString(maxPrice.toString());
-      await product.save();
-    } else {
-      // No variants → reset product price
-      product.price = null;
-      product.maxPrice = null;
-      await product.save();
-    }
+    // Non-deleted variants only; a $0/empty sale price falls back to base price.
+    const priceSummary = summarizeVariantPrices(allVariants);
+    product.price = priceSummary.price;
+    product.maxPrice = priceSummary.maxPrice;
+    await product.save();
 
     if (replacedCoverImage) {
       await deleteReplacedProductMedia([replacedCoverImage], userId);
@@ -1170,10 +1258,14 @@ exports.updateProduct = async (req, res) => {
       success: true,
       message: "Product and variants updated successfully",
       product,
-      variants: savedVariants
+      variants: savedVariants,
+      ...(autoUnpublished ? { autoUnpublished: true } : {}),
     });
   } catch (err) {
     console.error("Error updating product:", err);
+    if (variantWritesStarted) {
+      await recomputeProductPriceSummarySafe(req.params.productId, priceSummaryModels);
+    }
     return res.status(500).json({ error: "Internal server error" });
   }
 };
@@ -1399,24 +1491,8 @@ exports.addVariants = async (req, res) => {
       return res.status(404).json({ error: 'Subscription plan not found' });
     }
 
-    const productLimit = resolveProductListingLimit(
-      subscriptionPlan?.limits?.productListings || 0
-    );
-    const incomingVariantCount = Array.isArray(variants) ? variants.length : 0;
-    const usage = await countProductListingUsage({
-      Product,
-      ProductVariant,
-      businessId: product.businessId,
-    });
-    const quotaCheck = assertProductListingQuota({
-      total: usage.total,
-      incomingCount: incomingVariantCount,
-      limit: productLimit,
-    });
-
-    if (!quotaCheck.ok) {
-      return res.status(quotaCheck.status).json({ error: quotaCheck.error });
-    }
+    // Adding variants to an existing product never uses a listing slot (#514),
+    // so there is no quota check here; the subscription checks above remain.
 
     // Create new variants with unique SKUs
     const variantDocs = [];
@@ -1453,6 +1529,7 @@ exports.addVariants = async (req, res) => {
     await Product.findByIdAndUpdate(productId, {
       $push: { variants: { $each: variantIds } },
     });
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
 
     return res.status(201).json({
       message: 'Variants added successfully',
@@ -1529,8 +1606,10 @@ exports.updateVariant = async (req, res) => {
     }
     if (images) variant.images = images;
 
+    // true/'true'/1/'1', false/'false'/0/'0', else not sent.
+    const variantFlag = normalizePublishFlag(isPublished);
     const nextVariantPublished =
-      isPublished !== undefined ? isPublished : variant.isPublished;
+      variantFlag !== undefined ? variantFlag : variant.isPublished;
 
     if (nextVariantPublished) {
       const candidateVariant = {
@@ -1556,14 +1635,16 @@ exports.updateVariant = async (req, res) => {
       }
     }
 
-    if (isPublished !== undefined) variant.isPublished = isPublished;
+    if (variantFlag !== undefined) variant.isPublished = variantFlag;
 
     await variant.save();
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
     await deleteReplacedProductMedia(imagesToDelete, req.user._id);
 
     // Auto-publish/unpublish product based on variants
-    if (isPublished === true && !product.isPublished) {
-      const allVariants = await ProductVariant.find({ productId, isDeleted: false });
+    let autoUnpublished = false;
+    if (variantFlag === true && !product.isPublished) {
+      const allVariants = await ProductVariant.find({ productId, isDeleted: { $ne: true } });
       const publishCheck = validateProductPublishState({
         product,
         variants: allVariants,
@@ -1572,6 +1653,9 @@ exports.updateVariant = async (req, res) => {
       if (!publishCheck.ok) {
         variant.isPublished = false;
         await variant.save();
+        // The summary above counted this variant as live; refresh it now
+        // that the variant is back in Draft.
+        await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
         return res.status(400).json({
           error: publishCheck.message,
           code: publishCheck.code,
@@ -1579,22 +1663,18 @@ exports.updateVariant = async (req, res) => {
       }
       product.isPublished = true;
       await product.save();
-    } else if (isPublished === false) {
-      const publishedVariants = await ProductVariant.countDocuments({
-        productId,
-        isPublished: true,
-        isDeleted: false,
-      });
-      if (publishedVariants === 0) {
-        product.isPublished = false;
-        await product.save();
-      }
+    } else if (await autoUnpublishIfNoPricedLiveVariant(product)) {
+      // e.g. the only priced live variant was drafted and a $0 live one
+      // remains, or no live variant remains at all.
+      autoUnpublished = true;
+      await product.save();
     }
 
     return res.status(200).json({
       success: true,
       message: 'Variant updated successfully',
       variant,
+      ...(autoUnpublished ? { autoUnpublished: true } : {}),
     });
 
   } catch (err) {
@@ -1627,26 +1707,24 @@ exports.deleteVariant = async (req, res) => {
     // Soft delete
     variant.isDeleted = true;
     await variant.save();
+    await recomputeProductPriceSummarySafe(product._id, priceSummaryModels);
 
-    // Remove from product's variants array
-    product.variants = product.variants.filter(v => v.toString() !== variantId);
-    
-    // Check if any published variants remain
-    const publishedVariants = await ProductVariant.countDocuments({
-      productId,
-      isPublished: true,
-      isDeleted: false,
-    });
-
-    if (publishedVariants === 0) {
-      product.isPublished = false;
+    // Remove from product's variants array (not a Product schema path, so
+    // usually undefined; guard so the soft delete doesn't end in a 500)
+    if (Array.isArray(product.variants)) {
+      product.variants = product.variants.filter(v => v.toString() !== variantId);
     }
+
+    // Unpublish when no live variant with a usable price remains (this
+    // includes no live variant at all); the delete itself always stands.
+    const autoUnpublished = await autoUnpublishIfNoPricedLiveVariant(product);
 
     await product.save();
 
     return res.status(200).json({
       success: true,
       message: 'Variant deleted successfully',
+      ...(autoUnpublished ? { autoUnpublished: true } : {}),
     });
 
   } catch (err) {

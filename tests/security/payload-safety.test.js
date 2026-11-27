@@ -6,7 +6,6 @@ const path = require('node:path');
 const appPath = path.resolve(__dirname, '../../app.js');
 const userRoutesPath = path.resolve(__dirname, '../../routes/userRoutes.js');
 const authRoutesPath = path.resolve(__dirname, '../../routes/authRoutes.js');
-const paymentRoutesPath = path.resolve(__dirname, '../../routes/paymentRoutes.js');
 
 test('app.js registers Stripe webhooks before JSON parser with raw body', () => {
   const source = fs.readFileSync(appPath, 'utf8');
@@ -28,14 +27,12 @@ test('app.js applies mongo sanitize and XSS clean to body and params', () => {
   assert.ok(!source.includes('req.query = xssClean'), 'query must stay read-only on Express 5');
 });
 
-test('auth and payment routes declare rate limiters on sensitive POST endpoints', () => {
+test('auth routes declare rate limiters on sensitive POST endpoints', () => {
   const userSource = fs.readFileSync(userRoutesPath, 'utf8');
   const authSource = fs.readFileSync(authRoutesPath, 'utf8');
-  const paymentSource = fs.readFileSync(paymentRoutesPath, 'utf8');
 
   assert.match(userSource, /registerLimiter/);
   assert.match(userSource, /loginLimiter/);
   assert.match(userSource, /forgotPasswordLimiter/);
   assert.match(authSource, /googleStartLimiter/);
-  assert.match(paymentSource, /paymentLimiter/);
 });

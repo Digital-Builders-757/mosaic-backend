@@ -67,12 +67,18 @@ if [ "$EXPECTED_STATE" != "active" ] && [ "$EXPECTED_STATE" != "inactive" ]; the
   echo "--state must be active or inactive" >&2
   exit 2
 fi
-# An inherited rollback uses the existing canonical gate check. Rollback was
-# never an explicit verifier mode, so keep that interface unchanged.
 if [ "$RELEASE_MODE" != "release" ] && [ "$RELEASE_MODE" != "focused-baseline" ] \
-  && { [ "$RELEASE_MODE" != "rollback" ] || [ "$RELEASE_MODE_FLAG_SET" = true ]; }; then
-  echo "--release-mode must be release or focused-baseline" >&2
+  && [ "$RELEASE_MODE" != "rollback" ] \
+  && [ "$RELEASE_MODE" != "legacy-retirement-bootstrap" ]; then
+  echo "--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap" >&2
   exit 2
+fi
+# Break-glass rollback uses the canonical (release) gate path whether the mode
+# is inherited from RELEASE_MODE or passed explicitly with --release-mode, which
+# is what the production workflow does. The flag/environment agreement check
+# above still applies, so this cannot downgrade a focused-baseline gate.
+if [ "$RELEASE_MODE" = "rollback" ]; then
+  RELEASE_MODE="release"
 fi
 
 if [ "$#" -eq 0 ] && [ -n "${PRODUCTION_API_URL:-}" ]; then
@@ -80,7 +86,7 @@ if [ "$#" -eq 0 ] && [ -n "${PRODUCTION_API_URL:-}" ]; then
 fi
 
 if [ "$#" -eq 0 ]; then
-  echo "Usage: verify-checkout-gate.sh [--state active|inactive] [--release-mode release|focused-baseline] BASE_URL [BASE_URL ...]" >&2
+  echo "Usage: verify-checkout-gate.sh [--state active|inactive] [--release-mode release|rollback|focused-baseline|legacy-retirement-bootstrap] BASE_URL [BASE_URL ...]" >&2
   exit 2
 fi
 
@@ -137,13 +143,21 @@ checkout_paths=(
   "/API/ORDERS/INITIATE"
   "/Api/Orders/Initiate/"
 )
+legacy_payment_paths=(
+  "/api/payments/create-payment-intent"
+  "/api/payments/create-payment-intent/"
+  "/API/PAYMENTS/CREATE-PAYMENT-INTENT"
+  "/Api/Payments/Create-Payment-Intent/"
+)
 if [ "$RELEASE_MODE" = "focused-baseline" ]; then
-  checkout_paths+=(
-    "/api/payments/create-payment-intent"
-    "/api/payments/create-payment-intent/"
-    "/API/PAYMENTS/CREATE-PAYMENT-INTENT"
-    "/Api/Payments/Create-Payment-Intent/"
-  )
+  checkout_paths+=("${legacy_payment_paths[@]}")
+fi
+# The legacy-retirement bootstrap deploys over a live build that still mounts
+# the legacy route: while gated, both initiators must answer the ALB 503; once
+# ungated, the retired build must answer 404/405 (never the old 401).
+retirement_bootstrap=false
+if [ "$RELEASE_MODE" = "legacy-retirement-bootstrap" ]; then
+  retirement_bootstrap=true
 fi
 
 surface_number=0
@@ -168,6 +182,21 @@ for candidate_base_url in "$@"; do
       exit 1
     fi
   done
+
+  if [ "$retirement_bootstrap" = true ]; then
+    for path in "${legacy_payment_paths[@]}"; do
+      legacy_status=$(request_status POST "$path" "$BASE_URL")
+      echo "POST $path: HTTP $legacy_status"
+      if [ "$EXPECTED_STATE" = "active" ] && [ "$legacy_status" != "503" ]; then
+        echo "Checkout gate verification failed: expected infrastructure maintenance HTTP 503 for every legacy payment-intent path during retirement bootstrap" >&2
+        exit 1
+      fi
+      if [ "$EXPECTED_STATE" = "inactive" ] && [ "$legacy_status" != "404" ] && [ "$legacy_status" != "405" ]; then
+        echo "Legacy retirement verification failed: expected retired HTTP 404 or 405 for every legacy payment-intent path" >&2
+        exit 1
+      fi
+    done
+  fi
 
   for path in "${webhook_paths[@]}"; do
     status=$(request_status POST "$path" "$BASE_URL")

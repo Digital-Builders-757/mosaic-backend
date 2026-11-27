@@ -699,7 +699,7 @@ test('focused-baseline public verifier checks both routes on HTTP and HTTPS', ()
   assert.doesNotMatch(normal, /create-payment-intent/);
   assert.throws(
     () => runGateVerifierFixture({ releaseMode: 'unsupported' }),
-    (error) => error.status === 2 && /--release-mode must be release or focused-baseline/
+    (error) => error.status === 2 && /--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/
       .test(String(error.stderr))
   );
 });
@@ -729,20 +729,30 @@ test('gate verifier binds inherited release mode and rejects flag/environment di
     { inheritedReleaseMode: 'release' },
     {},
     { inheritedReleaseMode: 'rollback' },
+    // The production workflow passes --release-mode "$RELEASE_MODE" explicitly.
+    { releaseMode: 'rollback', inheritedReleaseMode: 'rollback' },
+    { releaseMode: 'rollback' },
   ]) {
     const canonicalOnly = runGateVerifierFixture(options);
     assert.equal(canonicalOnly.split('POST /api/orders/initiate: HTTP 503').length - 1, 2);
     assert.doesNotMatch(canonicalOnly, /create-payment-intent/);
   }
-  assert.throws(
-    () => runGateVerifierFixture({ releaseMode: 'rollback', inheritedReleaseMode: 'rollback' }),
-    (error) => error.status === 2
-      && /--release-mode must be release or focused-baseline/.test(String(error.stderr)),
-  );
+  for (const [releaseMode, inheritedReleaseMode] of [
+    ['rollback', 'release'],
+    ['rollback', 'focused-baseline'],
+    ['release', 'rollback'],
+    ['focused-baseline', 'rollback'],
+  ]) {
+    assert.throws(
+      () => runGateVerifierFixture({ releaseMode, inheritedReleaseMode }),
+      (error) => error.status === 2
+        && /--release-mode disagrees with inherited RELEASE_MODE/.test(String(error.stderr)),
+    );
+  }
   assert.throws(
     () => runGateVerifierFixture({ inheritedReleaseMode: '' }),
     (error) => error.status === 2
-      && /--release-mode must be release or focused-baseline/.test(String(error.stderr)),
+      && /--release-mode must be release, rollback, focused-baseline, or legacy-retirement-bootstrap/.test(String(error.stderr)),
   );
   assert.throws(
     () => runGateVerifierFixture({ releaseMode: '', inheritedReleaseMode: 'focused-baseline' }),

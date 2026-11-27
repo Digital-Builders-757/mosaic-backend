@@ -76,6 +76,10 @@ const getOwnerChildServiceCount = async (ownerId, excludeServiceId = null) => {
 exports.createParentService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
+  let committed = false;
 
   try {
     const {
@@ -109,6 +113,15 @@ exports.createParentService = async (req, res) => {
     const business = await Business.findOne({ _id: businessId, owner: userId });
     if (!business)
       return res.status(403).json({ error: 'You do not own this business.' });
+
+    // Service listings belong to service businesses only; product and
+    // other businesses have their own listing types.
+    if (business.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
+    }
 
     // Subscription check
     const subscription = await Subscription.findOne({
@@ -188,7 +201,7 @@ exports.createParentService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     res.status(201).json({
       message: 'Parent service created successfully. You can now add child services.',
@@ -196,11 +209,15 @@ exports.createParentService = async (req, res) => {
     });
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
     console.error('Parent service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create parent service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
@@ -208,6 +225,10 @@ exports.createParentService = async (req, res) => {
 exports.createService = async (req, res) => {
   const session = await Service.startSession();
   session.startTransaction();
+  // Ended in `finally` so early returns (ownership, type, validation, limits)
+  // never leak the session. Note: the writes below don't pass this session,
+  // so the transaction doesn't make them atomic; it is only cleaned up here.
+  let committed = false;
 
   try {
     const {
@@ -228,6 +249,15 @@ exports.createService = async (req, res) => {
     const business = await Business.findOne({ _id: businessId, owner: userId });
     if (!business)
       return res.status(403).json({ error: 'You do not own this business.' });
+
+    // Service listings belong to service businesses only; product and
+    // other businesses have their own listing types.
+    if (business.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
+    }
 
     const existingParentService = await Service.findOne({
       businessId,
@@ -357,24 +387,31 @@ exports.createService = async (req, res) => {
     }
 
     await session.commitTransaction();
-    session.endSession();
+    committed = true;
 
     return res.status(201).json(
       formatOwnerServiceResponse(service, business, 'Service created successfully.')
     );
 
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-
-    const usedImages = [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
+    // After a commit the service exists, so its images must not be removed.
+    const usedImages = committed
+      ? []
+      : [req.body.coverImage, ...(req.body.images || [])].filter(Boolean);
     for (const image of usedImages) {
       await deleteCloudinaryFile(image).catch(() => { });
       await PendingImage.deleteOne({ url: image }).catch(() => { });
     }
 
     console.error('Service creation failed:', err.message);
+    if (committed) {
+      // The listing was saved; this is a server fault, not a bad request.
+      return res.status(500).json({ error: 'The service was saved but the response failed. Reload to see it.' });
+    }
     return res.status(400).json({ error: err.message || 'Failed to create service' });
+  } finally {
+    if (!committed) await session.abortTransaction().catch(() => {});
+    session.endSession();
   }
 };
 
@@ -566,7 +603,7 @@ exports.addChildServices = async (req, res) => {
       return res.status(400).json({ error: 'childServices must be a non-empty array.' });
     }
 
-    const withBusinessOwner = (query) => query.populate('businessId', 'owner');
+    const withBusinessOwner = (query) => query.populate('businessId', 'owner listingType');
 
     let parentService = null;
 
@@ -601,6 +638,14 @@ exports.addChildServices = async (req, res) => {
 
     if (!isOwner && !isBusinessOwnerUser) {
       return res.status(403).json({ error: 'You do not own this parent service/business.' });
+    }
+
+    // Same rule as the create routes: services only under a service business.
+    if (parentService.businessId?.listingType !== 'service') {
+      return res.status(403).json({
+        code: 'SERVICE_BUSINESS_TYPE_MISMATCH',
+        error: 'Only service businesses can create service listings. Choose a service business.',
+      });
     }
 
     const subscription = await Subscription.findOne({

@@ -9,6 +9,17 @@ const FULL_SHA = /^[a-f0-9]{40}$/i;
 const ROLLBACK_CONFIRMATION = 'BREAK GLASS ROLLBACK EXACT SHA';
 const FOCUSED_BASELINE_SHA = '9bc75c257a9f483a287f122dbd38514b7a4b55d4';
 const FOCUSED_REF = /^refs\/heads\/release\/focused\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// The reviewed reconciliation digest is compared byte-for-byte downstream
+// (approval-job re-check, evidence), so it must be lowercase hex everywhere.
+const SHA256 = /^[a-f0-9]{64}$/;
+// One-time bootstrap for the first release that retires the legacy
+// POST /api/payments/create-payment-intent route. The normal release path
+// requires LEGACY_PAYMENT_RETIREMENT_SHA to already be live, which is circular
+// for the very first retired SHA. This mode is only admissible while that
+// variable is unset, so it disables itself once the retirement is recorded.
+const LEGACY_RETIREMENT_BOOTSTRAP = 'legacy-retirement-bootstrap';
+const BOOTSTRAP_CONFIRMATION = 'BOOTSTRAP LEGACY PAYMENT RETIREMENT EXACT SHA';
+const RELEASE_MODES = Object.freeze(['release', 'rollback', 'focused-baseline', LEGACY_RETIREMENT_BOOTSTRAP]);
 
 function git(args, options = {}) {
   return execFileSync('git', args, {
@@ -27,7 +38,7 @@ function parseArgs(argv) {
     values[argv[index].slice(2)] = argv[index + 1];
   }
   if (!['push', 'workflow_dispatch'].includes(values.event)
-      || !['release', 'rollback', 'focused-baseline'].includes(values.mode)
+      || !RELEASE_MODES.includes(values.mode)
       || !values.output) {
     throw new Error('Release event, mode, and output are required');
   }
@@ -45,6 +56,8 @@ function resolveProductionRelease({
   releaseRef,
   sourcePr,
   focusedRefSha,
+  legacyRetirementSha,
+  legacyReconciliationSha256,
   currentMainSha,
   commitExists,
   isAncestor,
@@ -69,6 +82,7 @@ function resolveProductionRelease({
   }
 
   let focusedSource = null;
+  let legacyRetirementBootstrap = null;
   if (mode === 'release') {
     if (candidate !== currentMainSha.toLowerCase()) {
       throw new Error('Normal production release candidate must equal the exact current main tip');
@@ -80,6 +94,23 @@ function resolveProductionRelease({
     if (!isAncestor(candidate, currentMainSha.toLowerCase())) {
       throw new Error('Rollback candidate must remain reachable from current main');
     }
+  } else if (mode === LEGACY_RETIREMENT_BOOTSTRAP) {
+    if (event !== 'workflow_dispatch' || confirmation !== BOOTSTRAP_CONFIRMATION) {
+      throw new Error('Legacy retirement bootstrap requires manual dispatch and the exact confirmation phrase');
+    }
+    if (String(legacyRetirementSha || '').trim() !== '') {
+      throw new Error('Legacy retirement bootstrap is disabled: LEGACY_PAYMENT_RETIREMENT_SHA is already recorded; use release or rollback');
+    }
+    if (!SHA256.test(String(legacyReconciliationSha256 || ''))) {
+      throw new Error('Legacy retirement bootstrap requires the reviewed LEGACY_PAYMENT_RECONCILIATION_SHA256 as 64 lowercase hex characters');
+    }
+    if (candidate !== currentMainSha.toLowerCase()) {
+      throw new Error('Legacy retirement bootstrap candidate must equal the exact current main tip');
+    }
+    legacyRetirementBootstrap = {
+      reconciliationSha256: String(legacyReconciliationSha256),
+      retirementShaRecorded: false,
+    };
   } else {
     const normalizedBaseline = String(baselineSha || '').toLowerCase();
     const normalizedRefSha = String(focusedRefSha || '').toLowerCase();
@@ -119,6 +150,7 @@ function resolveProductionRelease({
     sourceRequired: mode !== 'rollback',
     focusedBaseline: mode === 'focused-baseline',
     focusedSource,
+    legacyRetirementBootstrap,
   };
 }
 
@@ -146,6 +178,8 @@ function resolveWithGit(args) {
     releaseRef: args['release-ref'],
     sourcePr: args['source-pr'],
     focusedRefSha,
+    legacyRetirementSha: args['legacy-retirement-sha'],
+    legacyReconciliationSha256: args['legacy-reconciliation-sha256'],
     currentMainSha,
     commitExists(candidate) {
       try {
@@ -184,6 +218,7 @@ function main(argv = process.argv.slice(2)) {
       `baseline_sha=${result.focusedSource?.baselineSha || ''}`,
       `release_ref=${result.focusedSource?.releaseRef || ''}`,
       `source_pr=${result.focusedSource?.sourcePr || ''}`,
+      `legacy_retirement_bootstrap=${String(Boolean(result.legacyRetirementBootstrap))}`,
     ].join('\n') + '\n');
   }
   console.log(`Resolved ${result.mode} candidate ${result.releaseSha}.`);
@@ -199,7 +234,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  BOOTSTRAP_CONFIRMATION,
   FULL_SHA,
+  LEGACY_RETIREMENT_BOOTSTRAP,
+  RELEASE_MODES,
   ROLLBACK_CONFIRMATION,
   FOCUSED_BASELINE_SHA,
   FOCUSED_REF,

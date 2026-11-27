@@ -307,7 +307,7 @@
 | `/api/orders/ship/:orderId` | PUT | `routes/orderRoutes` | `inline` | authenticate, isBusinessOwner | JWT cookie/Bearer | business_owner | maybe | yes | — | listed |
 | `/api/orders/user` | GET | `routes/orderRoutes` | `inline` | authenticate | JWT cookie/Bearer | any authenticated | no | yes | — | listed |
 | `/api/orders/vendor` | GET | `routes/orderRoutes` | `inline` | authenticate, isBusinessOwner | JWT cookie/Bearer | business_owner | no | yes | — | listed |
-| `/api/payments/create-payment-intent` | POST | `routes/paymentRoutes` | `inline` | authenticate, isCustomer, rateLimit | JWT cookie/Bearer | customer | maybe | yes | — | listed |
+| `/api/payments/create-payment-intent` | POST | — (retired 2026-11-24) | — | — | — | — | — | — | — | retired (404) |
 | `/api/wishlist/` | GET | `routes/customer/wishlistRoutes` | `inline` | — | Public | — | no | no | — | listed |
 | `/api/wishlist/:productVariantId` | POST | `routes/customer/wishlistRoutes` | `inline` | — | Public | — | no | no | — | listed |
 | `/api/wishlist/:productVariantId` | DELETE | `routes/customer/wishlistRoutes` | `inline` | — | Public | — | yes | no | — | listed |
