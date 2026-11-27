@@ -408,8 +408,8 @@ function cliConfiguration(argv, env = process.env) {
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) throw new Error(`Unsupported option: ${key}`);
   }
-  if (mode !== 'verify' && Object.hasOwn(options, '--health-wait-seconds')) {
-    throw new Error('--health-wait-seconds is only supported in verify mode');
+  if (mode !== 'verify' && ['--health-wait-seconds', '--health-poll-seconds'].some((key) => Object.hasOwn(options, key))) {
+    throw new Error('--health-wait-seconds and --health-poll-seconds are only supported in verify mode');
   }
   return {
     mode,

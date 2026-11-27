@@ -439,7 +439,7 @@ test('production topology CLI preflight and verify remain strict on missing EB i
 
 // Run 46067921800: the post-deploy verify read instance health 15s after
 // UpdateEnvironment completed, while EB still reported the update as settling.
-function settlingHarness(healthSequence, { versionLabel } = {}) {
+function settlingHarness(healthSequence, { versionLabel, environmentSequence } = {}) {
   const fixture = topologyFixture();
   const responses = new Map([
     ['elasticbeanstalk describe-environments', fixture.environments],
@@ -452,6 +452,7 @@ function settlingHarness(healthSequence, { versionLabel } = {}) {
     ['elbv2 describe-load-balancer-attributes', fixture.loadBalancerAttributes],
   ]);
   let healthReads = 0;
+  let environmentReads = 0;
   let clockMs = 0;
   const sleeps = [];
   let evidence;
@@ -463,6 +464,13 @@ function settlingHarness(healthSequence, { versionLabel } = {}) {
       Object.assign(health.InstanceHealthList[0], { HealthStatus: status, Color: color });
       if (versionLabel) health.InstanceHealthList[0].Deployment.VersionLabel = versionLabel;
       return health;
+    }
+    if (service === 'elasticbeanstalk' && operation === 'describe-environments' && environmentSequence) {
+      const environments = structuredClone(fixture.environments);
+      const [status, health] = environmentSequence[Math.min(environmentReads, environmentSequence.length - 1)];
+      environmentReads += 1;
+      Object.assign(environments.Environments[0], { HealthStatus: status, Health: health });
+      return environments;
     }
     if (service === 'elbv2' && operation === 'describe-target-health') {
       return structuredClone(fixture.targetHealthByGroup[TARGET_GROUP_ARN]);
@@ -489,6 +497,14 @@ test('post-deploy verify polls instance health Info -> Ok within the limit and r
   assert.equal(h.healthReads, 3);
   assert.deepEqual(h.sleeps, [15000, 15000]);
   assert.equal(h.evidence.healthAttempts, 3);
+});
+
+test('post-deploy verify polls environment health Info -> Ok (Green colour, settling status)', () => {
+  const h = settlingHarness([['Ok', 'Green']], { environmentSequence: [['Info', 'Green'], ['Ok', 'Green']] });
+  const result = h.run(['--health-wait-seconds', '300', '--health-poll-seconds', '15']);
+  assert.equal(result.status, 'passed');
+  assert.deepEqual(h.sleeps, [15000]);
+  assert.equal(h.evidence.healthAttempts, 2);
 });
 
 test('post-deploy verify without a wait still checks once and fails fast (previous behaviour)', () => {
@@ -519,6 +535,7 @@ test('post-deploy verify never retries non-health mismatches such as the wrong v
 test('health waiting is verify-only and bounded', () => {
   for (const [args, pattern] of [
     [['preflight', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '60'], /only supported in verify mode/],
+    [['preflight', '--output', 'x.json', '--release-sha', SHA, '--health-poll-seconds', '15'], /only supported in verify mode/],
     [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '901'], /between 0 and 900/],
     [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-poll-seconds', '0'], /between 1 and 60/],
     [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '5.5'], /whole number/],
