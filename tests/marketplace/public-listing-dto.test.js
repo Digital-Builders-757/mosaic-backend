@@ -402,3 +402,72 @@ test('toPublicListingCard returns null imageUrl when no media exists', () => {
   assert.equal(card.imageUrl, null);
   assert.deepEqual(card.images, []);
 });
+
+test('toPublicListingDetail exposes product galleryImages in saved order after the cover', () => {
+  const detail = toPublicListingDetail(
+    {
+      _id: '507f1f77bcf86cd799439011',
+      title: 'Gallery Product',
+      coverImage: 'https://cdn.example.com/cover.jpg',
+      galleryImages: [
+        'https://cdn.example.com/gallery-2.jpg',
+        'https://cdn.example.com/gallery-1.jpg',
+      ],
+    },
+    { listingType: 'product' }
+  );
+
+  assert.deepEqual(detail.galleryImages, [
+    'https://cdn.example.com/gallery-2.jpg',
+    'https://cdn.example.com/gallery-1.jpg',
+  ]);
+  assert.deepEqual(detail.images, [
+    'https://cdn.example.com/cover.jpg',
+    'https://cdn.example.com/gallery-2.jpg',
+    'https://cdn.example.com/gallery-1.jpg',
+  ]);
+  assert.equal(detail.coverImage, 'https://cdn.example.com/cover.jpg');
+  assert.equal(detail.imageUrl, 'https://cdn.example.com/cover.jpg');
+  assertNoUndefinedValues(detail);
+});
+
+test('toPublicListingDetail drops empty and non-string gallery entries', () => {
+  const detail = toPublicListingDetail(
+    {
+      _id: '507f1f77bcf86cd799439011',
+      coverImage: 'https://cdn.example.com/cover.jpg',
+      galleryImages: ['', null, { url: 'x' }, '  ', 'https://cdn.example.com/a.jpg', 'https://cdn.example.com/a.jpg'],
+    },
+    { listingType: 'product' }
+  );
+
+  assert.deepEqual(detail.galleryImages, ['https://cdn.example.com/a.jpg']);
+  assert.deepEqual(detail.images, ['https://cdn.example.com/cover.jpg', 'https://cdn.example.com/a.jpg']);
+});
+
+test('toPublicListingDetail returns an empty gallery for a product with none and omits it for services', () => {
+  const product = toPublicListingDetail(
+    { _id: '507f1f77bcf86cd799439011', coverImage: 'https://cdn.example.com/cover.jpg', galleryImages: [] },
+    { listingType: 'product' }
+  );
+  assert.deepEqual(product.galleryImages, []);
+  assert.deepEqual(product.images, ['https://cdn.example.com/cover.jpg']);
+
+  const service = toPublicListingDetail(
+    { _id: '507f1f77bcf86cd799439012', title: 'Consulting', coverImage: 'https://cdn.example.com/svc.jpg' },
+    { listingType: 'service' }
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(service, 'galleryImages'), false);
+});
+
+test('toPublicListingCard does not add galleryImages to card payloads', () => {
+  const card = toPublicListingCard(
+    {
+      _id: '507f1f77bcf86cd799439011',
+      coverImage: 'https://cdn.example.com/cover.jpg',
+      galleryImages: ['https://cdn.example.com/a.jpg'],
+    },
+    { listingType: 'product' }
+  );
+  assert.equal(Object.prototype.hasOwnProperty.call(card, 'galleryImages'), false);
+});

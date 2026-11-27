@@ -34,11 +34,11 @@ Mount prefixes from [`app.js`](../app.js). All mutation routes require `authenti
 | `/admin/api/orders` | `routes/admin/adminOrderRoutes.js` | Per-route | Order list (read-only admin) |
 | `/admin/api/audit-events` | `routes/admin/adminAuditRoutes.js` | Global admin middleware | Audit trail read API |
 | `/api/admin/category/product` | `routes/admin/productCategoryRoutes.js` | Mutations guarded; **GET list public** | See §Public taxonomy reads |
-| `/api/admin/category/product-subcategory` | `routes/admin/productSubcategoryRoutes.js` | Global admin on mutations; **GET list public** | |
+| `/api/admin/category/product-subcategory` | `routes/admin/productSubcategoryRoutes.js` | Global admin middleware (GET list included) | Public reads use `GET /api/sub-categories` |
 | `/api/admin/category/service` | `routes/admin/categoryRoutes.js` | Mutations guarded; **GET list public** | |
-| `/api/admin/category/service-subcategory` | `routes/admin/serviceSubcategoryRoutes.js` | Mutations guarded; **GET list public** | |
+| `/api/admin/category/service-subcategory` | `routes/admin/serviceSubcategoryRoutes.js` | Global admin middleware (GET list included) | |
 | `/api/admin/category/food` | `routes/admin/foodCategoryRoutes.js` | Mutations guarded; **GET list public** | |
-| `/api/admin/category/food-subcategory` | `routes/admin/foodSubcategoryRoutes.js` | Mutations guarded; **GET list public** | |
+| `/api/admin/category/food-subcategory` | `routes/admin/foodSubcategoryRoutes.js` | Global admin middleware (GET list included) | |
 | `/api/admin/category-requests` | `routes/admin/categoryRequestRoutes.js` | Global admin middleware | Approve/reject vendor requests |
 | `/admin/business-profile-verify` | `routes/admin/businessProfileVerifyRoutes.js` | Per-route | Profile verification workflow |
 | `/admin/vendor-onboard-verify-stage1` | `routes/vendorOnboarding.routes.js` | Admin routes per-route | Pending queue, verify, finalize |
@@ -63,9 +63,8 @@ These admin-mounted **GET list** endpoints expose category metadata without auth
 | `GET /api/admin/category/product` | `productCategoryRoutes.js` |
 | `GET /api/admin/category/service` | `categoryRoutes.js` |
 | `GET /api/admin/category/food` | `foodCategoryRoutes.js` |
-| `GET /api/admin/category/*-subcategory` (list) | `*SubcategoryRoutes.js` |
 
-**Mutations** (POST/PUT/DELETE) on these mounts require admin. `GET /api/admin/categories` also requires admin and is documented in [`tests/admin/admin-categories-guard.test.js`](../tests/admin/admin-categories-guard.test.js).
+**Mutations** (POST/PUT/DELETE) on these mounts require admin. The `GET /api/admin/category/*-subcategory` lists now require admin as well (covered by [`tests/admin/admin-subcategory-routes-guard.test.js`](../tests/admin/admin-subcategory-routes-guard.test.js)); public subcategory reads go through `GET /api/sub-categories` and the per-category `/subcategories/:categoryId` routes, which only expose children of public parents. `GET /api/admin/categories` also requires admin and is documented in [`tests/admin/admin-categories-guard.test.js`](../tests/admin/admin-categories-guard.test.js).
 
 ---
 

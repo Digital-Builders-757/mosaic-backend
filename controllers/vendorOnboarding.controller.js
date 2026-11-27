@@ -11,7 +11,9 @@ const {
   stripProtectedVendorFields,
   applyVendorBusinessProfileFields,
   applyVendorDraftField,
+  normalizeOptionalDraftFields,
 } = require('../utils/vendorOnboardingProfileFields');
+const { sendError, sendValidationError } = require('../utils/apiError');
 const {
   syncBusinessFromOnboarding,
   isVendorSubscriptionError,
@@ -73,6 +75,34 @@ function logBusinessSyncFailure(endpoint, req, onboarding, error) {
   console.error(
     '[vendor-onboarding] business sync failed:',
     JSON.stringify(payload)
+  );
+}
+
+/**
+ * Mongoose validation/cast failures are caller errors, not server faults.
+ * Returns the invalid field paths (never values or raw validator messages).
+ */
+function getInvalidFieldPaths(error) {
+  if (error?.name === 'ValidationError' && error.errors) {
+    return Object.keys(error.errors);
+  }
+  if (error?.name === 'CastError' && error.path) {
+    return [error.path];
+  }
+  return null;
+}
+
+function sendInvalidDraftFields(req, res, invalidFields) {
+  // Log field names only — raw validator messages echo submitted values.
+  console.warn(
+    '[vendor-onboarding] save draft rejected invalid fields:',
+    JSON.stringify({ invalidFields })
+  );
+  return sendValidationError(
+    req,
+    res,
+    Object.fromEntries(invalidFields.map((field) => [field, 'Invalid value'])),
+    'Some fields have invalid values. Please review and try again.'
   );
 }
 
@@ -240,11 +270,22 @@ exports.saveDraft = async (req, res) => {
       }
     });
 
+    // 5b️⃣ Optional selects/numbers: "" / whitespace / null means "unset"
+    // (e.g. "Number Of Employees" left at "Select"); never feed "" to an enum.
+    const { payload: draftPayload, clearedFields, invalidFields } =
+      normalizeOptionalDraftFields(sanitizedPayload);
+    if (invalidFields.length > 0) {
+      return sendInvalidDraftFields(req, res, invalidFields);
+    }
+
     // 6️⃣ Apply payload
-    Object.keys(sanitizedPayload).forEach((key) => {
-      if (sanitizedPayload[key] !== undefined) {
-        applyVendorDraftField(onboarding, key, sanitizedPayload[key]);
+    Object.keys(draftPayload).forEach((key) => {
+      if (draftPayload[key] !== undefined) {
+        applyVendorDraftField(onboarding, key, draftPayload[key]);
       }
+    });
+    clearedFields.forEach((key) => {
+      onboarding.set(key, undefined);
     });
 
     // 6b️⃣ Enforce mutual exclusivity per diagram:
@@ -333,12 +374,12 @@ exports.saveDraft = async (req, res) => {
     });
 
   } catch (error) {
+    const invalidFields = getInvalidFieldPaths(error);
+    if (invalidFields) {
+      return sendInvalidDraftFields(req, res, invalidFields);
+    }
     console.error("Save draft error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to save data",
-      error: error.message,
-    });
+    return sendError(req, res, 500, { message: "Failed to save data" });
   }
 };
 
@@ -2069,7 +2110,6 @@ exports.getStatusByApplicationId = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: 'Failed to get application status',
-      error: error.message
     });
   }
 };

@@ -437,6 +437,119 @@ test('production topology CLI preflight and verify remain strict on missing EB i
   }
 });
 
+// Run 46067921800: the post-deploy verify read instance health 15s after
+// UpdateEnvironment completed, while EB still reported the update as settling.
+function settlingHarness(healthSequence, { versionLabel, environmentSequence } = {}) {
+  const fixture = topologyFixture();
+  const responses = new Map([
+    ['elasticbeanstalk describe-environments', fixture.environments],
+    ['elasticbeanstalk describe-configuration-settings', fixture.configuration.ConfigurationSettings],
+    ['elasticbeanstalk describe-environment-resources', fixture.resources],
+    ['autoscaling describe-auto-scaling-groups', fixture.autoScaling],
+    ['elbv2 describe-load-balancers', fixture.loadBalancers],
+    ['elbv2 describe-listeners', fixture.listeners],
+    ['elbv2 describe-target-groups', fixture.targetGroups],
+    ['elbv2 describe-load-balancer-attributes', fixture.loadBalancerAttributes],
+  ]);
+  let healthReads = 0;
+  let environmentReads = 0;
+  let clockMs = 0;
+  const sleeps = [];
+  let evidence;
+  const runAws = (service, operation) => {
+    if (service === 'elasticbeanstalk' && operation === 'describe-instances-health') {
+      const health = structuredClone(fixture.instanceHealth);
+      const [status, color] = healthSequence[Math.min(healthReads, healthSequence.length - 1)];
+      healthReads += 1;
+      Object.assign(health.InstanceHealthList[0], { HealthStatus: status, Color: color });
+      if (versionLabel) health.InstanceHealthList[0].Deployment.VersionLabel = versionLabel;
+      return health;
+    }
+    if (service === 'elasticbeanstalk' && operation === 'describe-environments' && environmentSequence) {
+      const environments = structuredClone(fixture.environments);
+      const [status, health] = environmentSequence[Math.min(environmentReads, environmentSequence.length - 1)];
+      environmentReads += 1;
+      Object.assign(environments.Environments[0], { HealthStatus: status, Health: health });
+      return environments;
+    }
+    if (service === 'elbv2' && operation === 'describe-target-health') {
+      return structuredClone(fixture.targetHealthByGroup[TARGET_GROUP_ARN]);
+    }
+    return structuredClone(responses.get(`${service} ${operation}`));
+  };
+  const run = (extraArgs) => topologyApi.main([
+    'verify', '--output', 'unused.json', '--release-sha', SHA, '--mixed-version-safe', 'false', ...extraArgs,
+  ], {
+    env: { AWS_REGION: REGION, EB_APPLICATION_NAME: APPLICATION, EB_ENVIRONMENT_NAME: ENVIRONMENT },
+    runAws,
+    now: () => clockMs,
+    sleep: (ms) => { sleeps.push(ms); clockMs += ms; },
+    writeJson(_path, result) { evidence = result; },
+    clock: () => new Date('2026-11-27T21:18:24.000Z'),
+  });
+  return { run, sleeps, get healthReads() { return healthReads; }, get evidence() { return evidence; } };
+}
+
+test('post-deploy verify polls instance health Info -> Ok within the limit and records attempts', () => {
+  const h = settlingHarness([['Info', 'Green'], ['Info', 'Green'], ['Ok', 'Green']]);
+  const result = h.run(['--health-wait-seconds', '300', '--health-poll-seconds', '15']);
+  assert.equal(result.status, 'passed');
+  assert.equal(h.healthReads, 3);
+  assert.deepEqual(h.sleeps, [15000, 15000]);
+  assert.equal(h.evidence.healthAttempts, 3);
+});
+
+test('post-deploy verify polls environment health Info -> Ok (Green colour, settling status)', () => {
+  const h = settlingHarness([['Ok', 'Green']], { environmentSequence: [['Info', 'Green'], ['Ok', 'Green']] });
+  const result = h.run(['--health-wait-seconds', '300', '--health-poll-seconds', '15']);
+  assert.equal(result.status, 'passed');
+  assert.deepEqual(h.sleeps, [15000]);
+  assert.equal(h.evidence.healthAttempts, 2);
+});
+
+test('post-deploy verify without a wait still checks once and fails fast (previous behaviour)', () => {
+  const h = settlingHarness([['Info', 'Green'], ['Ok', 'Green']]);
+  assert.throws(() => h.run([]), /Elastic Beanstalk instance [^ ]+ is not Green\/Ok/);
+  assert.equal(h.healthReads, 1);
+  assert.deepEqual(h.sleeps, []);
+  assert.equal(h.evidence.status, 'failed');
+});
+
+test('post-deploy verify fails closed when health never settles before the limit', () => {
+  const h = settlingHarness([['Warning', 'Yellow']]);
+  assert.throws(() => h.run(['--health-wait-seconds', '60', '--health-poll-seconds', '15']),
+    /Elastic Beanstalk instance [^ ]+ is not Green\/Ok/);
+  assert.equal(h.healthReads, 5);
+  assert.deepEqual(h.sleeps, [15000, 15000, 15000, 15000]);
+  assert.equal(h.evidence.status, 'failed');
+});
+
+test('post-deploy verify never retries non-health mismatches such as the wrong version', () => {
+  const h = settlingHarness([['Ok', 'Green']], { versionLabel: 'mosaic-' + 'f'.repeat(40) });
+  assert.throws(() => h.run(['--health-wait-seconds', '300', '--health-poll-seconds', '15']),
+    /has the wrong version|does not match the release SHA/);
+  assert.equal(h.healthReads, 1);
+  assert.deepEqual(h.sleeps, []);
+});
+
+test('health waiting is verify-only and bounded', () => {
+  for (const [args, pattern] of [
+    [['preflight', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '60'], /only supported in verify mode/],
+    [['preflight', '--output', 'x.json', '--release-sha', SHA, '--health-poll-seconds', '15'], /only supported in verify mode/],
+    [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '901'], /between 0 and 900/],
+    [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-poll-seconds', '0'], /between 1 and 60/],
+    [['verify', '--output', 'x.json', '--release-sha', SHA, '--health-wait-seconds', '5.5'], /whole number/],
+  ]) {
+    assert.throws(() => topologyApi.cliConfiguration(args, {}), pattern);
+  }
+  assert.equal(topologyApi.isSettlingHealthError(new Error('Elastic Beanstalk environment is not Ready/Green/Ok')), true);
+  assert.equal(topologyApi.isSettlingHealthError(new Error('Elastic Beanstalk instance abc123 has the wrong version')), false);
+  const workflow = fs.readFileSync(path.resolve(__dirname, '../../.github/workflows/deploy-eb-production.yml'), 'utf8').replaceAll('\r\n', '\n');
+  const verifyCall = workflow.slice(workflow.indexOf('node scripts/release/aws-release-topology.js verify'));
+  assert.match(verifyCall.slice(0, 400), /--health-wait-seconds 300 \\\n\s+--health-poll-seconds 15 \\\n/);
+  assert.doesNotMatch(workflow, /aws-release-topology\.js preflight[^\n]*\n(?:[^\n]*\\\n)*[^\n]*--health-wait-seconds/);
+});
+
 test('AWS topology collection uses an ARN selector and projects EB configuration', () => {
   const fixture = topologyFixture();
   const responses = new Map([
