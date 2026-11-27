@@ -734,6 +734,8 @@ jobs:
           node scripts/release/aws-release-topology.js verify \
             --release-sha "$RELEASE_SHA" \
             --mixed-version-safe false \
+            --health-wait-seconds 300 \
+            --health-poll-seconds 15 \
             --output release-evidence/aws-deployed.json
 
       - name: Verify exact public release while checkout stays gated
