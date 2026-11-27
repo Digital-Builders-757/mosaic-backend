@@ -89,8 +89,12 @@ function validateTopology(payload, options) {
     throw new Error('Elastic Beanstalk environment version does not match the release SHA');
   }
 
+  // collectAwsTopology's --query makes the AWS CLI return a bare ConfigurationSettings
+  // array; fixtures and the focused adapter pass the documented { ConfigurationSettings } shape.
   const configuration = one(
-    payload.configuration && payload.configuration.ConfigurationSettings,
+    Array.isArray(payload.configuration)
+      ? payload.configuration
+      : payload.configuration && payload.configuration.ConfigurationSettings,
     'ConfigurationSettings'
   );
   if (configuration.ApplicationName !== applicationName || configuration.EnvironmentName !== environmentName) {
