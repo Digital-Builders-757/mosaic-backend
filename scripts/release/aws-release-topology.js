@@ -369,15 +369,47 @@ function collectAwsTopology({ runAws, region, applicationName, environmentName }
   };
 }
 
+// Elastic Beanstalk reports instance/environment health a few seconds behind a
+// completed UpdateEnvironment (e.g. Info/Warning "Application update in
+// progress"). Only these settle-time health conditions are retried; every other
+// topology or identity mismatch still fails on the first read.
+const SETTLING_HEALTH_ERRORS = [
+  /^Elastic Beanstalk instance [^ ]+ is not Green\/Ok$/,
+  /^Elastic Beanstalk environment is not Ready\/Green\/Ok$/,
+];
+
+function isSettlingHealthError(error) {
+  const message = error && error.message;
+  return typeof message === 'string' && SETTLING_HEALTH_ERRORS.some((pattern) => pattern.test(message));
+}
+
+function boundedSeconds(value, label, min, max) {
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) throw new Error(`${label} must be a whole number of seconds`);
+  const seconds = Number(text);
+  if (seconds < min || seconds > max) throw new Error(`${label} must be between ${min} and ${max}`);
+  return seconds;
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
 function cliConfiguration(argv, env = process.env) {
   const options = parseOptions(argv, { positionals: 1 });
   const mode = options._[0];
   if (!['preflight', 'verify'].includes(mode)) {
     throw new Error('Usage: aws-release-topology.js preflight|verify --output <json> [options]');
   }
-  const allowed = new Set(['_', '--output', '--fixture', '--release-sha', '--mixed-version-safe']);
+  const allowed = new Set([
+    '_', '--output', '--fixture', '--release-sha', '--mixed-version-safe',
+    '--health-wait-seconds', '--health-poll-seconds',
+  ]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) throw new Error(`Unsupported option: ${key}`);
+  }
+  if (mode !== 'verify' && Object.hasOwn(options, '--health-wait-seconds')) {
+    throw new Error('--health-wait-seconds is only supported in verify mode');
   }
   return {
     mode,
@@ -392,6 +424,12 @@ function cliConfiguration(argv, env = process.env) {
       '--mixed-version-safe',
       false
     ),
+    healthWaitSeconds: boundedSeconds(
+      optionalOption(options, '--health-wait-seconds', '0'), '--health-wait-seconds', 0, 900
+    ),
+    healthPollSeconds: boundedSeconds(
+      optionalOption(options, '--health-poll-seconds', '15'), '--health-poll-seconds', 1, 60
+    ),
     region: env.AWS_REGION || EXPECTED_REGION,
     applicationName: env.EB_APPLICATION_NAME || EXPECTED_APPLICATION,
     environmentName: env.EB_ENVIRONMENT_NAME || EXPECTED_ENVIRONMENT,
@@ -403,15 +441,33 @@ function main(argv = process.argv.slice(2), dependencies = {}) {
   try {
     const config = cliConfiguration(argv, dependencies.env || process.env);
     outputPath = config.output;
-    const payload = config.fixture
-      ? readJson(config.fixture, 'Topology fixture')
-      : collectAwsTopology({
-        runAws: dependencies.runAws || createAwsCliRunner(dependencies),
-        region: config.region,
-        applicationName: config.applicationName,
-        environmentName: config.environmentName,
-      });
-    const result = validateTopology(payload, { ...config, clock: dependencies.clock });
+    const runAws = config.fixture ? null : (dependencies.runAws || createAwsCliRunner(dependencies));
+    const now = dependencies.now || Date.now;
+    const sleep = dependencies.sleep || sleepSync;
+    const deadline = now() + config.healthWaitSeconds * 1000;
+    let attempts = 0;
+    let result;
+    for (;;) {
+      attempts += 1;
+      const payload = config.fixture
+        ? readJson(config.fixture, 'Topology fixture')
+        : collectAwsTopology({
+          runAws,
+          region: config.region,
+          applicationName: config.applicationName,
+          environmentName: config.environmentName,
+        });
+      try {
+        result = validateTopology(payload, { ...config, clock: dependencies.clock });
+        break;
+      } catch (error) {
+        const waitMs = config.healthPollSeconds * 1000;
+        if (!isSettlingHealthError(error) || now() + waitMs > deadline) throw error;
+        console.log(`AWS release topology ${config.mode}: health still settling (attempt ${attempts}); rechecking.`);
+        sleep(waitMs);
+      }
+    }
+    result.healthAttempts = attempts;
     (dependencies.writeJson || writeJson)(config.output, result);
     console.log(`AWS release topology ${config.mode} passed; evidence written.`);
     return result;
@@ -452,6 +508,7 @@ module.exports = {
   EXPECTED_REGION,
   cliConfiguration,
   collectAwsTopology,
+  isSettlingHealthError,
   main,
   optionValue,
   validateTopology,
