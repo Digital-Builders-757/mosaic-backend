@@ -9,12 +9,10 @@ const {
 const authenticate = require('../../middlewares/authenticate');
 const isAdmin = require('../../middlewares/isAdmin');
 
-
-router.get('/', getProductSubcategories);
-
 // All routes protected for admin
 router.use(authenticate, isAdmin);
 
+router.get('/', getProductSubcategories);
 router.post('/', createProductSubcategory);
 router.put('/:id', updateProductSubcategory);
 router.delete('/:id', deleteProductSubcategory);
