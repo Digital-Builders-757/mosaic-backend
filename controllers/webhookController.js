@@ -349,6 +349,21 @@ const handleStripeWebhook = async (req, res) => {
 };
 
 // Add to webhookController.js or create subscriptionWebhook.js
+// Stripe subscription states after which a local *pending* record can never be
+// paid. Only pending records are touched: an active plan is never downgraded here.
+const ENDED_STRIPE_SUBSCRIPTION_STATUSES = new Set(['incomplete_expired', 'canceled']);
+
+async function expirePendingLocalSubscription(stripeSubscriptionId) {
+  if (!stripeSubscriptionId) return null;
+  const expired = await Subscription.findOneAndUpdate(
+    { stripeSubscriptionId, status: 'pending' },
+    { $set: { status: 'expired' } },
+    { new: true }
+  );
+  if (expired) console.log(`Expired pending subscription ${expired._id} (Stripe ${stripeSubscriptionId} ended)`);
+  return expired;
+}
+
 const handleSubscriptionWebhook = async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const payload = req.body;
@@ -403,6 +418,15 @@ const handleSubscriptionWebhook = async (req, res) => {
       // Backstop for ordering: when Stripe flips the subscription to active,
       // activate from its latest invoice if (and only if) that invoice is paid.
       const updatedSubscription = event.data.object;
+      if (ENDED_STRIPE_SUBSCRIPTION_STATUSES.has(updatedSubscription?.status)) {
+        try {
+          await expirePendingLocalSubscription(updatedSubscription.id);
+        } catch (error) {
+          console.error(`Error handling ${event.type}:`, error);
+          return res.status(500).send({ received: false });
+        }
+        break;
+      }
       if (!ACTIVE_STRIPE_SUBSCRIPTION_STATUSES.has(updatedSubscription?.status)) break;
       const latestInvoiceId =
         typeof updatedSubscription.latest_invoice === 'string'
@@ -417,6 +441,16 @@ const handleSubscriptionWebhook = async (req, res) => {
           invoice: latestInvoice,
           onActivated: triggerTierWelcomeNotifications,
         });
+      } catch (error) {
+        console.error(`Error handling ${event.type}:`, error);
+        return res.status(500).send({ received: false });
+      }
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      try {
+        await expirePendingLocalSubscription(event.data.object?.id);
       } catch (error) {
         console.error(`Error handling ${event.type}:`, error);
         return res.status(500).send({ received: false });
