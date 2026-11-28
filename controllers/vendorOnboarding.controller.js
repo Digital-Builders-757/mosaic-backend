@@ -1920,9 +1920,16 @@ exports.getStatusByApplicationId = async (req, res) => {
     }
 
     // Fetch subscription only - Business Profile data is in onboarding
-    const subscription = await Subscription.findOne({ userId })
-      .sort({ createdAt: -1 })
-      .populate('subscriptionPlanId');
+    // An active plan wins over any newer pending attempt (a retried or abandoned
+    // checkout must not push a paid vendor back to "Payment Pending"). Otherwise
+    // use the newest attempt that can still be paid.
+    const subscription =
+      (await Subscription.findOne({ userId, status: 'active' })
+        .sort({ createdAt: -1 })
+        .populate('subscriptionPlanId')) ||
+      (await Subscription.findOne({ userId, status: { $nin: ['expired', 'cancelled'] } })
+        .sort({ createdAt: -1 })
+        .populate('subscriptionPlanId'));
 
     // ✅ Check logo and bio directly from onboarding document
     const hasLogo = onboarding.businessProfileImage?.url && 

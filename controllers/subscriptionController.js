@@ -3,6 +3,95 @@ const Subscription = require('../models/Subscription');
 const SubscriptionPlan = require('../models/SubscriptionPlan');
 const { ensurePlanPrice } = require('../helpers/stripePlan'); // ← ADD THIS
 const { triggerTierWelcomeNotifications } = require('../utils/vendorTierWelcomeEmail');
+const {
+  ACTIVE_STRIPE_SUBSCRIPTION_STATUSES,
+  activateSubscriptionFromPaidInvoice,
+  invoiceClientSecret,
+} = require('../utils/subscriptionInvoiceActivation');
+
+const INVOICE_EXPAND = ['latest_invoice.confirmation_secret'];
+
+/**
+ * A pending local subscription whose Stripe subscription is still incomplete
+ * with an open invoice is resumed (same customer, same invoice) instead of
+ * creating another customer + subscription. If Stripe already reports it paid
+ * and active, it is activated from that invoice.
+ */
+async function resumePendingSubscription({ userId, planId, applicationId }) {
+  const query = {
+    userId,
+    subscriptionPlanId: planId,
+    status: 'pending',
+    stripeSubscriptionId: { $exists: true, $ne: null },
+  };
+  // Never resume across applications: a request without an application id
+  // only matches pending records that also have none.
+  query.applicationId = applicationId || null;
+
+  const pending = await Subscription.findOne(query).sort({ createdAt: -1 });
+  if (!pending) return null;
+
+  const expirePending = async () => {
+    await Subscription.findOneAndUpdate(
+      { _id: pending._id, status: 'pending' },
+      { $set: { status: 'expired' } }
+    );
+  };
+
+  let stripeSubscription;
+  try {
+    stripeSubscription = await stripe.subscriptions.retrieve(
+      pending.stripeSubscriptionId,
+      { expand: INVOICE_EXPAND }
+    );
+  } catch (error) {
+    if (error?.code === 'resource_missing' || error?.statusCode === 404) {
+      await expirePending();
+      return null;
+    }
+    throw error;
+  }
+  const invoice = stripeSubscription.latest_invoice;
+
+  if (stripeSubscription.status === 'incomplete' && invoice?.status === 'open') {
+    const clientSecret = invoiceClientSecret(invoice);
+    if (clientSecret) {
+      return {
+        pending,
+        stripeSubscription,
+        clientSecret,
+        active: false,
+        amountDue: typeof invoice.amount_due === 'number' ? invoice.amount_due : null,
+      };
+    }
+    // An open invoice we cannot hand to the client must not fall through to a
+    // second subscription: that could leave two payable invoices.
+    return { blocked: 'invoice_unpayable' };
+  }
+
+  if (stripeSubscription.status === 'incomplete' && invoice?.status === 'paid') {
+    // Paid, and Stripe has not flipped the subscription to active yet. The
+    // webhook activates it; creating another subscription now could charge twice.
+    return { blocked: 'payment_processing' };
+  }
+
+  if (['incomplete_expired', 'canceled'].includes(stripeSubscription.status)) {
+    await expirePending();
+    return null;
+  }
+
+  if (ACTIVE_STRIPE_SUBSCRIPTION_STATUSES.has(stripeSubscription.status) && invoice?.status === 'paid') {
+    const result = await activateSubscriptionFromPaidInvoice({
+      stripe,
+      Subscription,
+      invoice,
+      onActivated: triggerTierWelcomeNotifications,
+    });
+    return { pending: result.subscription || pending, stripeSubscription, clientSecret: null, active: true };
+  }
+
+  return null;
+}
 
 exports.createSubscription = async (req, res) => {
   try {
@@ -47,6 +136,35 @@ exports.createSubscription = async (req, res) => {
       });
     }
 
+    if (plan.price > 0) {
+      const resumed = await resumePendingSubscription({ userId, planId, applicationId });
+      if (resumed?.blocked) {
+        return res.status(409).json({
+          success: false,
+          code: resumed.blocked === 'payment_processing'
+            ? 'SUBSCRIPTION_PAYMENT_PROCESSING'
+            : 'SUBSCRIPTION_INVOICE_UNPAYABLE',
+          message: resumed.blocked === 'payment_processing'
+            ? 'Your payment is being confirmed. Please refresh in a minute instead of paying again.'
+            : 'Your pending subscription cannot be resumed right now. Please contact support instead of paying again.'
+        });
+      }
+      if (resumed) {
+        return res.status(200).json({
+          success: true,
+          message: resumed.active ? 'Subscription activated' : 'Subscription created, payment required',
+          data: {
+            subscriptionId: resumed.pending._id,
+            stripeSubscriptionId: resumed.stripeSubscription.id,
+            clientSecret: resumed.clientSecret,
+            amount: resumed.amountDue ?? plan.price * 100,
+            currency: plan.currency,
+            resumed: true,
+          }
+        });
+      }
+    }
+
     // Create Stripe customer
     const customer = await stripe.customers.create({
       email: req.user.email,
@@ -54,33 +172,33 @@ exports.createSubscription = async (req, res) => {
       metadata: { userId: userId.toString() }
     });
 
-    // Create subscription with incomplete status
+    // Create subscription with incomplete status; its first invoice carries the payment.
     const stripeSubscription = await stripe.subscriptions.create({
       customer: customer.id,
       items: [{ price: priceId }],
       payment_behavior: 'default_incomplete',
       payment_settings: { save_default_payment_method: 'on_subscription' },
-      expand: ['latest_invoice.payment_intent'],
+      expand: INVOICE_EXPAND,
       metadata: {
         userId: userId.toString(),
         planId: planId.toString()
       }
     });
 
-    // Get client secret - if missing, create payment intent manually
-    let clientSecret = stripeSubscription.latest_invoice?.payment_intent?.client_secret;
+    // The client pays the subscription's own invoice. Never create a separate
+    // PaymentIntent: it would charge the vendor without paying the invoice.
+    const clientSecret = invoiceClientSecret(stripeSubscription.latest_invoice);
 
     if (!clientSecret && plan.price > 0) {
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(plan.price * 100),
-        currency: plan.currency || 'usd',
-        customer: customer.id,
-        metadata: {
-          subscriptionId: stripeSubscription.id,
-          userId: userId.toString()
-        }
+      try {
+        await stripe.subscriptions.cancel(stripeSubscription.id);
+      } catch (cancelError) {
+        console.error('Failed to cancel subscription without invoice payment:', cancelError);
+      }
+      return res.status(502).json({
+        success: false,
+        message: 'Stripe did not return a payment for the subscription invoice. Please try again.'
       });
-      clientSecret = paymentIntent.client_secret;
     }
 
     const requiresPayment = plan.price > 0;
