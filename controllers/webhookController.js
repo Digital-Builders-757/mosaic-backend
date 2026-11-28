@@ -11,6 +11,10 @@ const {
 } = require('../utils/sendOrderPaidConfirmation');
 const { sendVendorTierWelcomeSMS } = require('../utils/telnyxService');
 const { triggerTierWelcomeNotifications } = require('../utils/vendorTierWelcomeEmail');
+const {
+  activateSubscriptionFromPaidInvoice,
+  subscriptionIdFromInvoice,
+} = require('../utils/subscriptionInvoiceActivation');
 const User = require('../models/User');
 const SubscriptionPlan = require('../models/SubscriptionPlan');
 
@@ -374,36 +378,38 @@ const handleSubscriptionWebhook = async (req, res) => {
       break;
 
     case 'invoice.payment_succeeded':
-      const invoice = event.data.object;
-      console.log('🔹 Stripe subscription ID:', invoice.subscription);
+    case 'invoice.paid': {
+      // Activate only from the subscription's own paid invoice, after Stripe
+      // confirms the subscription itself is active.
+      try {
+        await activateSubscriptionFromPaidInvoice({
+          stripe,
+          Subscription,
+          invoice: event.data.object,
+          onActivated: triggerTierWelcomeNotifications,
+        });
+      } catch (error) {
+        console.error(`Error handling ${event.type}:`, error);
+        return res.status(500).send({ received: false });
+      }
+      break;
+    }
 
-      const subscription = await Subscription.findOne({
-        stripeSubscriptionId: invoice.subscription
-      });
+    case 'invoice.payment_failed': {
+      const failedInvoice = event.data.object;
+      const failedStripeSubscriptionId = subscriptionIdFromInvoice(failedInvoice);
 
-      if (!subscription) {
-        console.error('❌ Subscription not found for:', invoice.subscription);
+      if (!failedStripeSubscriptionId) {
+        console.error('❌ Failed invoice has no subscription:', failedInvoice?.id);
         break;
       }
 
-      subscription.paymentStatus = 'COMPLETED';
-      subscription.status = 'active';
-      await subscription.save();
-      console.log(`✅ Subscription payment succeeded: ${subscription._id}`);
-
-      // Send tier welcome email + SMS notifications idempotently (non-blocking)
-      triggerTierWelcomeNotifications(subscription);
-      break;
-
-    case 'invoice.payment_failed':
-      const failedInvoice = event.data.object;
-
       const failedSub = await Subscription.findOne({
-        stripeSubscriptionId: failedInvoice.subscription
+        stripeSubscriptionId: failedStripeSubscriptionId
       });
 
       if (!failedSub) {
-        console.error('❌ Failed subscription not found for:', failedInvoice.subscription);
+        console.error('❌ Failed subscription not found for:', failedStripeSubscriptionId);
         break;
       }
 
@@ -412,72 +418,18 @@ const handleSubscriptionWebhook = async (req, res) => {
       await failedSub.save();
       console.log(`❌ Subscription payment failed: ${failedSub._id}`);
       break;
+    }
 
     case 'charge.updated':
-      const charge = event.data.object;
-      
-      if (charge.status === 'succeeded' && charge.metadata.subscriptionId) {
-        try {
-          const subscription = await Subscription.findOne({
-            stripeSubscriptionId: charge.metadata.subscriptionId
-          });
-
-          if (subscription) {
-            subscription.paymentStatus = 'COMPLETED';
-            subscription.status = 'active';
-            await subscription.save();
-            console.log(`✅ Subscription charge updated - payment succeeded: ${subscription._id}`);
-            triggerTierWelcomeNotifications(subscription);
-          } else {
-            console.error('❌ Subscription not found for:', charge.metadata.subscriptionId);
-          }
-        } catch (error) {
-          console.error('Error handling charge.updated:', error);
-        }
-      }
-      break;
-
     case 'charge.succeeded':
-      const chargeSucceeded = event.data.object;
-      
-      if (chargeSucceeded.metadata.subscriptionId) {
-        try {
-          const subscription = await Subscription.findOne({
-            stripeSubscriptionId: chargeSucceeded.metadata.subscriptionId
-          });
-
-          if (subscription) {
-            subscription.paymentStatus = 'COMPLETED';
-            subscription.status = 'active';
-            await subscription.save();
-            console.log(`✅ Subscription charge succeeded: ${subscription._id}`);
-            triggerTierWelcomeNotifications(subscription);
-          }
-        } catch (error) {
-          console.error('Error handling charge.succeeded:', error);
-        }
-      }
-      break;
-
     case 'payment_intent.succeeded':
-      const paymentIntentSucceeded = event.data.object;
-      
-      if (paymentIntentSucceeded.metadata.subscriptionId) {
-        try {
-          const subscription = await Subscription.findOne({
-            stripeSubscriptionId: paymentIntentSucceeded.metadata.subscriptionId
-          });
-
-          if (subscription) {
-            subscription.paymentStatus = 'COMPLETED';
-            subscription.status = 'active';
-            await subscription.save();
-            console.log(`✅ Subscription payment intent succeeded: ${subscription._id}`);
-            triggerTierWelcomeNotifications(subscription);
-          }
-        } catch (error) {
-          console.error('Error handling payment_intent.succeeded:', error);
-        }
+      // A charge or PaymentIntent tagged with metadata.subscriptionId is not the
+      // subscription's invoice (older checkout created a separate PaymentIntent).
+      // It never activates a plan; invoice.paid / invoice.payment_succeeded do.
+      if (event.data.object?.metadata?.subscriptionId) {
+        console.log(
+          `Ignoring ${event.type} for subscription ${event.data.object.metadata.subscriptionId}: activation requires the subscription invoice to be paid`
+        );
       }
       break;
 
