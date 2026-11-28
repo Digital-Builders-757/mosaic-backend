@@ -403,3 +403,69 @@ test('resume never crosses applications and expires records Stripe no longer has
   assert.equal(calls.subscriptionsCreate.length, 1);
   assert.equal(calls.paymentIntentsCreate, 0);
 });
+
+async function createWithPending(retrievedSubscription) {
+  const { Subscription, calls: modelCalls } = makeSubscriptionModel({
+    pending: { _id: 'local_pending', status: 'pending', stripeSubscriptionId: 'sub_pending' },
+  });
+  const { client, calls } = makeStripe({ retrievedSubscription });
+  const { mod } = loadWithMocks(controllerPath, { stripeClient: client, Subscription });
+  const res = mockResponse();
+  await mod.createSubscription(
+    { user: { _id: 'user1', email: 'qa@example.test', name: 'QA' }, body: { planId: 'plan_launch' }, query: {} },
+    res
+  );
+  return { res, calls, modelCalls };
+}
+
+test('resume refuses a second subscription while a paid invoice waits for Stripe to activate', async () => {
+  const { res, calls } = await createWithPending({
+    status: 'incomplete',
+    latest_invoice: { id: 'in_pending', status: 'paid' },
+  });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'SUBSCRIPTION_PAYMENT_PROCESSING');
+  assert.equal(calls.customersCreate, 0);
+  assert.equal(calls.subscriptionsCreate.length, 0);
+  assert.equal(calls.paymentIntentsCreate, 0);
+});
+
+test('resume refuses a second subscription when the open invoice has no client secret', async () => {
+  const { res, calls } = await createWithPending({
+    status: 'incomplete',
+    latest_invoice: { id: 'in_pending', status: 'open' },
+  });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'SUBSCRIPTION_INVOICE_UNPAYABLE');
+  assert.equal(calls.subscriptionsCreate.length, 0);
+});
+
+test('an ended Stripe subscription expires only a pending local record', async () => {
+  const events = [
+    { type: 'customer.subscription.updated', data: { object: { id: 'sub_own', status: 'incomplete_expired' } } },
+    { type: 'customer.subscription.updated', data: { object: { id: 'sub_own', status: 'canceled' } } },
+    { type: 'customer.subscription.deleted', data: { object: { id: 'sub_own', status: 'canceled' } } },
+  ];
+  for (const event of events) {
+    const label = `${event.type}:${event.data.object.status}`;
+    const pending = await runWebhook(event, { local: { _id: 'local1', status: 'pending' } });
+    assert.equal(pending.res.statusCode, 200, label);
+    assert.deepEqual(
+      pending.modelCalls.findOneAndUpdate[0],
+      { filter: { stripeSubscriptionId: 'sub_own', status: 'pending' }, update: { $set: { status: 'expired' } } },
+      label
+    );
+    assert.equal(pending.welcome.length, 0, label);
+  }
+});
+
+test('expiry never downgrades an active plan', async () => {
+  // The update filter requires status "pending"; the real query cannot match an
+  // active record. The mock mirrors that by refusing to update active records.
+  const { res, modelCalls } = await runWebhook(
+    { type: 'customer.subscription.deleted', data: { object: { id: 'sub_own', status: 'canceled' } } },
+    { local: { _id: 'local1', status: 'active' } }
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(modelCalls.findOneAndUpdate[0].filter.status, 'pending');
+});

@@ -64,7 +64,15 @@ async function resumePendingSubscription({ userId, planId, applicationId }) {
         amountDue: typeof invoice.amount_due === 'number' ? invoice.amount_due : null,
       };
     }
-    return null;
+    // An open invoice we cannot hand to the client must not fall through to a
+    // second subscription: that could leave two payable invoices.
+    return { blocked: 'invoice_unpayable' };
+  }
+
+  if (stripeSubscription.status === 'incomplete' && invoice?.status === 'paid') {
+    // Paid, and Stripe has not flipped the subscription to active yet. The
+    // webhook activates it; creating another subscription now could charge twice.
+    return { blocked: 'payment_processing' };
   }
 
   if (['incomplete_expired', 'canceled'].includes(stripeSubscription.status)) {
@@ -130,6 +138,17 @@ exports.createSubscription = async (req, res) => {
 
     if (plan.price > 0) {
       const resumed = await resumePendingSubscription({ userId, planId, applicationId });
+      if (resumed?.blocked) {
+        return res.status(409).json({
+          success: false,
+          code: resumed.blocked === 'payment_processing'
+            ? 'SUBSCRIPTION_PAYMENT_PROCESSING'
+            : 'SUBSCRIPTION_INVOICE_UNPAYABLE',
+          message: resumed.blocked === 'payment_processing'
+            ? 'Your payment is being confirmed. Please refresh in a minute instead of paying again.'
+            : 'Your pending subscription cannot be resumed right now. Please contact support instead of paying again.'
+        });
+      }
       if (resumed) {
         return res.status(200).json({
           success: true,
