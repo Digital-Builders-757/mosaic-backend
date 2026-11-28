@@ -24,20 +24,51 @@ async function resumePendingSubscription({ userId, planId, applicationId }) {
     status: 'pending',
     stripeSubscriptionId: { $exists: true, $ne: null },
   };
-  if (applicationId) query.applicationId = applicationId;
+  // Never resume across applications: a request without an application id
+  // only matches pending records that also have none.
+  query.applicationId = applicationId || null;
 
   const pending = await Subscription.findOne(query).sort({ createdAt: -1 });
   if (!pending) return null;
 
-  const stripeSubscription = await stripe.subscriptions.retrieve(
-    pending.stripeSubscriptionId,
-    { expand: INVOICE_EXPAND }
-  );
+  const expirePending = async () => {
+    await Subscription.findOneAndUpdate(
+      { _id: pending._id, status: 'pending' },
+      { $set: { status: 'expired' } }
+    );
+  };
+
+  let stripeSubscription;
+  try {
+    stripeSubscription = await stripe.subscriptions.retrieve(
+      pending.stripeSubscriptionId,
+      { expand: INVOICE_EXPAND }
+    );
+  } catch (error) {
+    if (error?.code === 'resource_missing' || error?.statusCode === 404) {
+      await expirePending();
+      return null;
+    }
+    throw error;
+  }
   const invoice = stripeSubscription.latest_invoice;
 
   if (stripeSubscription.status === 'incomplete' && invoice?.status === 'open') {
     const clientSecret = invoiceClientSecret(invoice);
-    if (clientSecret) return { pending, stripeSubscription, clientSecret, active: false };
+    if (clientSecret) {
+      return {
+        pending,
+        stripeSubscription,
+        clientSecret,
+        active: false,
+        amountDue: typeof invoice.amount_due === 'number' ? invoice.amount_due : null,
+      };
+    }
+    return null;
+  }
+
+  if (['incomplete_expired', 'canceled'].includes(stripeSubscription.status)) {
+    await expirePending();
     return null;
   }
 
@@ -107,7 +138,7 @@ exports.createSubscription = async (req, res) => {
             subscriptionId: resumed.pending._id,
             stripeSubscriptionId: resumed.stripeSubscription.id,
             clientSecret: resumed.clientSecret,
-            amount: plan.price * 100,
+            amount: resumed.amountDue ?? plan.price * 100,
             currency: plan.currency,
             resumed: true,
           }

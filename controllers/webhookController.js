@@ -12,6 +12,7 @@ const {
 const { sendVendorTierWelcomeSMS } = require('../utils/telnyxService');
 const { triggerTierWelcomeNotifications } = require('../utils/vendorTierWelcomeEmail');
 const {
+  ACTIVE_STRIPE_SUBSCRIPTION_STATUSES,
   activateSubscriptionFromPaidInvoice,
   subscriptionIdFromInvoice,
 } = require('../utils/subscriptionInvoiceActivation');
@@ -382,10 +383,38 @@ const handleSubscriptionWebhook = async (req, res) => {
       // Activate only from the subscription's own paid invoice, after Stripe
       // confirms the subscription itself is active.
       try {
-        await activateSubscriptionFromPaidInvoice({
+        const result = await activateSubscriptionFromPaidInvoice({
           stripe,
           Subscription,
           invoice: event.data.object,
+          onActivated: triggerTierWelcomeNotifications,
+        });
+        if (result.retryable) {
+          return res.status(500).send({ received: false, retry: result.reason });
+        }
+      } catch (error) {
+        console.error(`Error handling ${event.type}:`, error);
+        return res.status(500).send({ received: false });
+      }
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      // Backstop for ordering: when Stripe flips the subscription to active,
+      // activate from its latest invoice if (and only if) that invoice is paid.
+      const updatedSubscription = event.data.object;
+      if (!ACTIVE_STRIPE_SUBSCRIPTION_STATUSES.has(updatedSubscription?.status)) break;
+      const latestInvoiceId =
+        typeof updatedSubscription.latest_invoice === 'string'
+          ? updatedSubscription.latest_invoice
+          : updatedSubscription.latest_invoice?.id;
+      if (!latestInvoiceId) break;
+      try {
+        const latestInvoice = await stripe.invoices.retrieve(latestInvoiceId);
+        await activateSubscriptionFromPaidInvoice({
+          stripe,
+          Subscription,
+          invoice: latestInvoice,
           onActivated: triggerTierWelcomeNotifications,
         });
       } catch (error) {
@@ -414,7 +443,12 @@ const handleSubscriptionWebhook = async (req, res) => {
       }
 
       failedSub.paymentStatus = 'FAILED';
-      failedSub.status = 'cancelled';
+      // A declined FIRST invoice stays open and payable: keep the record
+      // pending so checkout resumes the same invoice instead of creating a
+      // second subscription (which could lead to two paid invoices).
+      if (failedInvoice?.billing_reason !== 'subscription_create') {
+        failedSub.status = 'cancelled';
+      }
       await failedSub.save();
       console.log(`❌ Subscription payment failed: ${failedSub._id}`);
       break;

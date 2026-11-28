@@ -67,7 +67,13 @@ async function activateSubscriptionFromPaidInvoice({
     logger.warn?.(
       `Invoice ${invoice.id} paid but Stripe subscription ${stripeSubscriptionId} is ${stripeSubscription?.status}; not activating`
     );
-    return { activated: false, reason: `stripe_subscription_${stripeSubscription?.status}` };
+    // `incomplete` right after a paid invoice is transient: ask the caller to
+    // let Stripe retry rather than acknowledging and losing the activation.
+    return {
+      activated: false,
+      reason: `stripe_subscription_${stripeSubscription?.status}`,
+      retryable: stripeSubscription?.status === 'incomplete',
+    };
   }
 
   const updated = await Subscription.findOneAndUpdate(

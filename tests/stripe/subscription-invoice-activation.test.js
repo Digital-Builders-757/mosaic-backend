@@ -57,6 +57,8 @@ function makeSubscriptionModel({ local = null, pending = null } = {}) {
 function makeStripe({
   createdSubscription,
   retrievedSubscription,
+  retrieveError,
+  invoice,
 } = {}) {
   const calls = {
     customersCreate: 0,
@@ -79,12 +81,16 @@ function makeStripe({
       },
       retrieve: async (id, params) => {
         calls.subscriptionsRetrieve.push({ id, params });
+        if (retrieveError) throw retrieveError;
         return { id, ...retrievedSubscription };
       },
       cancel: async (id) => {
         calls.subscriptionsCancel.push(id);
         return { id, status: 'canceled' };
       },
+    },
+    invoices: {
+      retrieve: async (id) => ({ id, ...invoice }),
     },
     paymentIntents: {
       create: async () => {
@@ -286,10 +292,10 @@ test('createSubscription resumes a pending subscription and its open invoice ins
   assert.deepEqual(calls.subscriptionsRetrieve[0].params, { expand: ['latest_invoice.confirmation_secret'] });
 });
 
-async function runWebhook(event, { local, stripeStatus = 'active' }) {
+async function runWebhook(event, { local, stripeStatus = 'active', invoice }) {
   process.env.STRIPE_SUBSCRIPTION_WEBHOOK_SECRET = 'whsec_test';
   const { Subscription, calls: modelCalls } = makeSubscriptionModel({ local });
-  const { client } = makeStripe({ retrievedSubscription: { status: stripeStatus } });
+  const { client } = makeStripe({ retrievedSubscription: { status: stripeStatus }, invoice });
   const { mod, welcome } = loadWithMocks(webhookPath, { stripeClient: client, Subscription });
   const res = mockResponse();
   const originalLog = console.log;
@@ -334,4 +340,66 @@ test('webhook activates on invoice.paid and invoice.payment_succeeded for the su
     { local: { _id: 'local1', status: 'pending' }, stripeStatus: 'incomplete' }
   );
   assert.equal(stillIncomplete.modelCalls.findOneAndUpdate.length, 0);
+  assert.equal(stillIncomplete.res.statusCode, 500, 'paid invoice + still-incomplete subscription asks Stripe to retry');
+});
+
+test('customer.subscription.updated activates only when its latest invoice is paid', async () => {
+  const paid = await runWebhook(
+    { type: 'customer.subscription.updated', data: { object: { id: 'sub_own', status: 'active', latest_invoice: 'in_own' } } },
+    { local: { _id: 'local1', status: 'pending' }, invoice: paidInvoice() }
+  );
+  assert.equal(paid.res.statusCode, 200);
+  assert.equal(paid.modelCalls.findOneAndUpdate.length, 1);
+
+  const open = await runWebhook(
+    { type: 'customer.subscription.updated', data: { object: { id: 'sub_own', status: 'active', latest_invoice: 'in_own' } } },
+    { local: { _id: 'local1', status: 'pending' }, invoice: paidInvoice({ status: 'open' }) }
+  );
+  assert.equal(open.modelCalls.findOneAndUpdate.length, 0);
+});
+
+test('a declined first invoice keeps the record pending so checkout resumes it', async () => {
+  for (const [billingReason, expected] of [['subscription_create', 'pending'], ['subscription_cycle', 'cancelled']]) {
+    const saved = [];
+    const local = { _id: 'local1', status: 'pending', paymentStatus: 'PENDING' };
+    local.save = async function save() {
+      saved.push({ status: this.status, paymentStatus: this.paymentStatus });
+      return this;
+    };
+    const { res } = await runWebhook(
+      { type: 'invoice.payment_failed', data: { object: paidInvoice({ status: 'open', billing_reason: billingReason }) } },
+      { local }
+    );
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(saved, [{ status: expected, paymentStatus: 'FAILED' }], billingReason);
+  }
+});
+
+test('resume never crosses applications and expires records Stripe no longer has', async () => {
+  const { Subscription, calls: modelCalls } = makeSubscriptionModel({
+    pending: { _id: 'local_pending', status: 'pending', stripeSubscriptionId: 'sub_gone' },
+  });
+  const missing = Object.assign(new Error('No such subscription'), { code: 'resource_missing', statusCode: 404 });
+  const { client, calls } = makeStripe({
+    retrieveError: missing,
+    createdSubscription: {
+      id: 'sub_new',
+      status: 'incomplete',
+      latest_invoice: { id: 'in_new', status: 'open', confirmation_secret: { client_secret: 'in_new_cs' } },
+    },
+  });
+  const { mod } = loadWithMocks(controllerPath, { stripeClient: client, Subscription });
+  const res = mockResponse();
+
+  await mod.createSubscription(
+    { user: { _id: 'user1', email: 'qa@example.test', name: 'QA' }, body: { planId: 'plan_launch' }, query: {} },
+    res
+  );
+
+  const pendingQuery = modelCalls.findOne.find((q) => q.status === 'pending');
+  assert.equal(pendingQuery.applicationId, null, 'no application id only matches records without one');
+  assert.deepEqual(modelCalls.findOneAndUpdate[0].update, { $set: { status: 'expired' } });
+  assert.equal(res.statusCode, 201, 'falls through to a fresh subscription');
+  assert.equal(calls.subscriptionsCreate.length, 1);
+  assert.equal(calls.paymentIntentsCreate, 0);
 });
